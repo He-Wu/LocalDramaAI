@@ -131,6 +131,34 @@ async def test_health_reports_bounded_sanitized_http_errors(status_code: int):
 
 
 @pytest.mark.anyio
+async def test_health_bounds_and_sanitizes_an_empty_body_reason_phrase():
+    secret = "do-not-leak-this-password"
+    reason_phrase = (
+        f"  upstream 上游\tfailed password={secret}\n"
+        + ("理由填充 reason-phrase-padding " * 100)
+    )
+    provider = MuseTalkProvider(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                599,
+                content=b"",
+                extensions={"reason_phrase": reason_phrase.encode("utf-8")},
+            )
+        )
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        await provider.health()
+
+    message = str(caught.value)
+    assert "HTTP 599" in message
+    assert "upstream 上游 failed" in message
+    assert secret not in message
+    assert message.endswith("...")
+    assert len(message) < 700
+
+
+@pytest.mark.anyio
 async def test_generate_posts_absolute_paths_and_fixed_service_options(tmp_path: Path):
     video_path, audio_path = _source_files(tmp_path)
     output_dir = tmp_path / "published output"

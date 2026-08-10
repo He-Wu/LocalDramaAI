@@ -36,14 +36,25 @@ class MuseTalkProvider:
 
     @staticmethod
     def _error_detail(response: httpx.Response) -> str:
-        content = response.content
-        truncated = len(content) > _MAX_ERROR_DETAIL_BYTES
-        detail = content[:_MAX_ERROR_DETAIL_BYTES].decode("utf-8", errors="replace")
-        detail = " ".join(detail.split())
-        detail = _SENSITIVE_DETAIL_VALUE.sub(r"\1<redacted>", detail)
-        if truncated:
-            detail += "..."
-        return detail or response.reason_phrase
+        def bounded_detail(value: bytes) -> str:
+            truncated = len(value) > _MAX_ERROR_DETAIL_BYTES
+            detail = value[:_MAX_ERROR_DETAIL_BYTES].decode(
+                "utf-8",
+                errors="replace",
+            )
+            detail = " ".join(detail.split())
+            detail = _SENSITIVE_DETAIL_VALUE.sub(r"\1<redacted>", detail)
+            if truncated:
+                detail += "..."
+            return detail
+
+        detail = bounded_detail(response.content)
+        if detail:
+            return detail
+        reason_phrase = response.extensions.get("reason_phrase")
+        if not isinstance(reason_phrase, bytes):
+            reason_phrase = response.reason_phrase.encode("utf-8", errors="replace")
+        return bounded_detail(reason_phrase)
 
     async def _request_object(
         self,
