@@ -86,9 +86,41 @@ def _audio_only_fixture(tmp_path):
     )
 
 
+def _matroska_av_fixture(tmp_path):
+    return _ffmpeg(
+        tmp_path / "av.mkv",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=640x368:rate=25:duration=1",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=1000:sample_rate=48000:duration=1",
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-r",
+        "25",
+        "-fps_mode",
+        "cfr",
+        "-c:a",
+        "aac",
+        "-ac",
+        "1",
+        "-shortest",
+    )
+
+
 def test_probe_av_reports_real_video_audio_and_container_metadata(tmp_path):
     info = probe_av(_av_fixture(tmp_path))
 
+    assert "mp4" in info.format_name.split(",")
     assert info.video.codec == "h264"
     assert info.video.pixel_format == "yuv420p"
     assert (info.video.width, info.video.height) == (640, 368)
@@ -101,6 +133,14 @@ def test_probe_av_reports_real_video_audio_and_container_metadata(tmp_path):
     assert info.audio.channels == 1
     assert info.audio.duration > 0
     assert info.duration > 0
+
+
+def test_probe_av_reports_real_matroska_container(tmp_path):
+    info = probe_av(_matroska_av_fixture(tmp_path))
+
+    assert "matroska" in info.format_name.split(",")
+    assert info.video.codec == "h264"
+    assert info.audio.codec == "aac"
 
 
 def test_probe_av_rejects_real_video_without_audio(tmp_path):

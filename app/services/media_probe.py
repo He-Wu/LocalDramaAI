@@ -36,6 +36,7 @@ class AVInfo:
     video: VideoStreamInfo
     audio: AudioStreamInfo
     duration: float
+    format_name: str
 
 
 def _positive_float(value: object) -> float | None:
@@ -134,7 +135,7 @@ def probe_av(path: Path, executable: str = "ffprobe") -> AVInfo:
                 (
                     "stream=codec_type,codec_name,pix_fmt,width,height,"
                     "avg_frame_rate,r_frame_rate,nb_frames,duration,sample_rate,channels:"
-                    "format=duration"
+                    "format=duration,format_name"
                 ),
                 "-of",
                 "json",
@@ -169,6 +170,9 @@ def probe_av(path: Path, executable: str = "ffprobe") -> AVInfo:
     format_duration = _positive_float(format_metadata.get("duration"))
     if format_duration is None:
         raise ValueError(f"media has no positive container duration: {path}")
+    format_name = _metadata_text(format_metadata.get("format_name"))
+    if format_name is None:
+        raise ValueError(f"media has no recognized container format: {path}")
 
     video = None
     audio = None
@@ -186,4 +190,9 @@ def probe_av(path: Path, executable: str = "ffprobe") -> AVInfo:
         raise ValueError(f"media contains no playable video stream: {path}")
     if audio is None:
         raise ValueError(f"media contains no playable audio stream: {path}")
-    return AVInfo(video=video, audio=audio, duration=format_duration)
+    return AVInfo(
+        video=video,
+        audio=audio,
+        duration=format_duration,
+        format_name=format_name,
+    )

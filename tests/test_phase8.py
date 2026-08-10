@@ -1,12 +1,16 @@
 import asyncio
+import copy
+import hashlib
 import json
-import shutil
 import subprocess
+import threading
 import wave
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from sqlalchemy.orm import Session
 
 from app.db.session import create_schema, session_scope
 from app.models import Asset, Dialogue, GenerationManifest, Project, Scene, Shot
@@ -72,6 +76,14 @@ def _wav(path: Path, *, duration: float = TARGET_DURATION, sample_rate: int = 24
         output.setframerate(sample_rate)
         output.writeframes(b"\x00\x00" * int(duration * sample_rate))
     return path
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 @pytest.fixture(scope="session")
@@ -234,6 +246,37 @@ def _valid_manifest(**overrides) -> dict:
     return manifest
 
 
+def _bound_manifest(
+    video_path: Path,
+    audio_path: Path,
+    output_path: Path,
+    metadata: dict,
+) -> dict:
+    output_sha256 = _sha256(output_path) if output_path.is_file() else "0" * 64
+    return {
+        **_valid_manifest(),
+        "model": "musetalk-v1.5",
+        "workflow": "musetalk_lipsync",
+        "target_duration": metadata["target_duration"],
+        "metadata": {
+            "project_id": metadata["project_id"],
+            "shot_id": metadata["shot_id"],
+            "input_assets": list(metadata["input_assets"]),
+        },
+        "source_video": {
+            "path": str(video_path.resolve()),
+            "sha256": _sha256(video_path),
+        },
+        "source_audio": {
+            "path": str(audio_path.resolve()),
+            "sha256": _sha256(audio_path),
+        },
+        "output_path": str(output_path.resolve()),
+        "sha256": output_sha256,
+        "output_sha256": output_sha256,
+    }
+
+
 class BoundaryProvider:
     def __init__(self, *, error: Exception | None = None):
         self.error = error or RuntimeError("provider boundary sentinel")
@@ -245,10 +288,20 @@ class BoundaryProvider:
 
 
 class DeterministicMuseTalkProvider:
-    def __init__(self, *, mode: str = "valid", manifest: object | None = None, mutate=None):
+    def __init__(
+        self,
+        *,
+        mode: str = "valid",
+        manifest: object | None = None,
+        manifest_mutation: str | None = None,
+        mutate=None,
+        barrier: threading.Barrier | None = None,
+    ):
         self.mode = mode
-        self.manifest = _valid_manifest() if manifest is None else manifest
+        self.manifest = manifest
+        self.manifest_mutation = manifest_mutation
         self.mutate = mutate
+        self.barrier = barrier
         self.calls = []
 
     async def generate(self, video_path: Path, audio_path: Path, output_dir: Path, metadata: dict):
@@ -259,8 +312,16 @@ class DeterministicMuseTalkProvider:
         if self.mode == "exception":
             raise RuntimeError("MuseTalk failed")
 
-        output = output_dir / "lipsync.mp4"
-        manifest_path = output_dir / "lipsync.manifest.json"
+        output = (
+            output_dir.parent / "escaped-lipsync.mp4"
+            if self.mode == "escaped_output"
+            else output_dir / ("lipsync.mkv" if self.mode == "matroska" else "lipsync.mp4")
+        )
+        manifest_path = (
+            output_dir.parent / "escaped-lipsync.manifest.json"
+            if self.mode == "escaped_manifest"
+            else output_dir / "lipsync.manifest.json"
+        )
         target = float(metadata["target_duration"])
 
         if self.mode == "missing_output":
@@ -365,11 +426,43 @@ class DeterministicMuseTalkProvider:
             elif self.mode == "empty_manifest":
                 manifest_path.write_bytes(b"")
             else:
-                manifest_path.write_text(json.dumps(self.manifest), encoding="utf-8")
+                manifest = (
+                    _bound_manifest(video_path, audio_path, output, metadata)
+                    if self.manifest is None
+                    else copy.deepcopy(self.manifest)
+                )
+                if self.manifest_mutation == "project_id":
+                    manifest["metadata"]["project_id"] = "other-project"
+                elif self.manifest_mutation == "shot_id":
+                    manifest["metadata"]["shot_id"] = "other-shot"
+                elif self.manifest_mutation == "input_assets":
+                    manifest["metadata"]["input_assets"] = list(reversed(metadata["input_assets"]))
+                elif self.manifest_mutation == "target_duration":
+                    manifest["target_duration"] = target + 0.5
+                elif self.manifest_mutation == "source_video_path":
+                    manifest["source_video"]["path"] = str(audio_path.resolve())
+                elif self.manifest_mutation == "source_video_sha256":
+                    manifest["source_video"]["sha256"] = "0" * 64
+                elif self.manifest_mutation == "source_audio_path":
+                    manifest["source_audio"]["path"] = str(video_path.resolve())
+                elif self.manifest_mutation == "source_audio_sha256":
+                    manifest["source_audio"]["sha256"] = "0" * 64
+                elif self.manifest_mutation == "output_path":
+                    manifest["output_path"] = str(video_path.resolve())
+                elif self.manifest_mutation == "output_sha256":
+                    manifest["output_sha256"] = "0" * 64
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
         if self.mutate is not None:
             self.mutate()
-        return output, manifest_path
+        if self.barrier is not None:
+            self.barrier.wait(timeout=10)
+        returned_manifest = (
+            Path("..") / manifest_path.name
+            if self.mode == "escaped_manifest"
+            else manifest_path
+        )
+        return output, returned_manifest
 
 
 @pytest.mark.parametrize(
@@ -447,10 +540,14 @@ def test_lipsync_happy_path_persists_validated_output_and_preserves_source(tmp_p
             "workflow_name": "musetalk_lipsync",
             "generation_time": 0.25,
             "source_video_asset_id": seed.source_asset_id,
+            "source_video_sha256": _sha256(phase8_media["video"]),
             "dialogue_id": seed.dialogue_id,
             "audio_asset_id": seed.audio_asset_id,
+            "source_audio_sha256": _sha256(phase8_media["audio"]),
             "input_assets": [seed.source_asset_id, seed.audio_asset_id],
             "target_duration": TARGET_DURATION,
+            "output_sha256": _sha256(Path(persisted.path)),
+            "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
             "duration": pytest.approx(TARGET_DURATION, abs=0.04),
             "video_duration": pytest.approx(TARGET_DURATION, abs=0.04),
             "audio_duration": pytest.approx(TARGET_DURATION, abs=0.04),
@@ -633,6 +730,46 @@ def test_lipsync_provider_failures_persist_nothing(tmp_path, phase8_media, mode,
     _assert_no_lipsync_success(seed)
 
 
+@pytest.mark.parametrize("mode", ["escaped_output", "escaped_manifest"])
+def test_lipsync_rejects_provider_paths_outside_output_directory(tmp_path, phase8_media, mode):
+    seed = _seed_shot(tmp_path, phase8_media)
+    provider = DeterministicMuseTalkProvider(mode=mode)
+
+    with pytest.raises(RuntimeError, match="outside output_dir"):
+        _run_lipsync(seed, provider, tmp_path / "output")
+
+    _assert_no_lipsync_success(seed)
+
+
+@pytest.mark.parametrize(
+    "manifest_mutation",
+    [
+        "project_id",
+        "shot_id",
+        "input_assets",
+        "target_duration",
+        "source_video_path",
+        "source_video_sha256",
+        "source_audio_path",
+        "source_audio_sha256",
+        "output_path",
+        "output_sha256",
+    ],
+)
+def test_lipsync_rejects_manifest_not_bound_to_request_or_artifacts(
+    tmp_path,
+    phase8_media,
+    manifest_mutation,
+):
+    seed = _seed_shot(tmp_path, phase8_media)
+    provider = DeterministicMuseTalkProvider(manifest_mutation=manifest_mutation)
+
+    with pytest.raises(RuntimeError, match="manifest"):
+        _run_lipsync(seed, provider, tmp_path / "output")
+
+    _assert_no_lipsync_success(seed)
+
+
 @pytest.mark.parametrize(
     "manifest",
     [
@@ -668,6 +805,7 @@ def test_lipsync_rejects_invalid_manifest_provenance(tmp_path, phase8_media, man
         ("wrong_audio_codec", "AAC"),
         ("short", "shorter"),
         ("av_delta", "synchronization"),
+        ("matroska", "MP4/MOV"),
     ],
 )
 def test_lipsync_rejects_invalid_final_media_without_registration(tmp_path, phase8_media, mode, message):
@@ -747,6 +885,87 @@ def test_lipsync_rechecks_snapshot_after_provider_and_rejects_concurrent_mutatio
     provider = DeterministicMuseTalkProvider(mutate=mutate)
 
     with pytest.raises(RuntimeError, match="changed during lip sync generation"):
+        _run_lipsync(seed, provider, tmp_path / "output")
+
+    _assert_no_lipsync_success(seed)
+
+
+def test_lipsync_serializes_two_stale_generations_and_persists_exactly_one(
+    tmp_path,
+    phase8_media,
+    monkeypatch,
+):
+    from app.services import lipsync_generation
+
+    seed = _seed_shot(tmp_path, phase8_media)
+    provider_barrier = threading.Barrier(2)
+    stale_check_barrier = threading.Barrier(2)
+    original_assert = lipsync_generation._assert_snapshot_unchanged
+
+    def synchronized_stale_check(session, snapshot, *args, **kwargs):
+        shot = original_assert(session, snapshot, *args, **kwargs)
+        try:
+            stale_check_barrier.wait(timeout=0.5)
+        except threading.BrokenBarrierError:
+            pass
+        return shot
+
+    monkeypatch.setattr(
+        lipsync_generation,
+        "_assert_snapshot_unchanged",
+        synchronized_stale_check,
+    )
+
+    def generate(index):
+        provider = DeterministicMuseTalkProvider(barrier=provider_barrier)
+        try:
+            return _run_lipsync(seed, provider, tmp_path / f"output-{index}")
+        except Exception as exc:  # the losing call is part of the asserted result
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(generate, index) for index in range(2)]
+        outcomes = [future.result(timeout=30) for future in futures]
+
+    successes = [outcome for outcome in outcomes if isinstance(outcome, Asset)]
+    failures = [outcome for outcome in outcomes if isinstance(outcome, Exception)]
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert isinstance(failures[0], RuntimeError)
+    assert "changed during lip sync generation" in str(failures[0])
+
+    with session_scope(seed.database) as session:
+        shot = session.get(Shot, seed.shot_id)
+        assets = session.query(Asset).filter_by(kind="LIPSYNC").all()
+        manifests = session.query(GenerationManifest).filter_by(provider="musetalk").all()
+        assert len(assets) == 1
+        assert len(manifests) == 1
+        assert shot.lipsync_asset_id == assets[0].id == manifests[0].asset_id
+        assert manifests[0].output_asset == assets[0].id
+
+
+def test_lipsync_rolls_back_asset_flush_when_later_database_work_fails(
+    tmp_path,
+    phase8_media,
+    monkeypatch,
+):
+    seed = _seed_shot(tmp_path, phase8_media)
+    provider = DeterministicMuseTalkProvider()
+    original_flush = Session.flush
+
+    def fail_after_lipsync_asset_flush(session, *args, **kwargs):
+        has_pending_lipsync = any(
+            isinstance(value, Asset) and value.kind == "LIPSYNC"
+            for value in session.new
+        )
+        result = original_flush(session, *args, **kwargs)
+        if has_pending_lipsync:
+            raise RuntimeError("injected database failure after Asset flush")
+        return result
+
+    monkeypatch.setattr(Session, "flush", fail_after_lipsync_asset_flush)
+
+    with pytest.raises(RuntimeError, match="after Asset flush"):
         _run_lipsync(seed, provider, tmp_path / "output")
 
     _assert_no_lipsync_success(seed)

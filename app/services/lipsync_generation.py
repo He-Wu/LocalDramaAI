@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from dataclasses import dataclass
+from numbers import Real
 from pathlib import Path
+
+from sqlalchemy import text
 
 from app.db.session import session_scope
 from app.models import Asset, Dialogue, GenerationManifest, Scene, Shot
@@ -26,6 +30,7 @@ _OUTPUT_AV_TOLERANCE = 0.08
 _TOLERANCE_EPSILON = 1e-9
 _MODEL_NAME = "musetalk-v1.5"
 _WORKFLOW_NAME = "musetalk_lipsync"
+_MP4_MOV_FORMATS = {"mov", "mp4", "m4a", "3gp", "3g2", "mj2"}
 
 
 @dataclass(frozen=True)
@@ -53,13 +58,36 @@ class _ProviderProvenance:
     seed: int | None
 
 
-def _owned_shot(session, project_id: str, shot_id: str) -> Shot | None:
-    return (
+@dataclass(frozen=True)
+class _ValidatedInputs:
+    video_path: Path
+    audio_path: Path
+    video_sha256: str
+    audio_sha256: str
+
+
+def _owned_shot(
+    session,
+    project_id: str,
+    shot_id: str,
+    *,
+    for_update: bool = False,
+) -> Shot | None:
+    query = (
         session.query(Shot)
         .join(Scene, Shot.scene_id == Scene.id)
         .filter(Shot.id == shot_id, Scene.project_id == project_id)
-        .one_or_none()
     )
+    if for_update:
+        query = query.with_for_update()
+    return query.one_or_none()
+
+
+def _asset_by_id(session, asset_id: str, *, for_update: bool = False) -> Asset | None:
+    query = session.query(Asset).filter(Asset.id == asset_id)
+    if for_update:
+        query = query.with_for_update()
+    return query.one_or_none()
 
 
 def _positive_duration(value: object, label: str) -> float:
@@ -97,12 +125,54 @@ def _provider_file(value: object, output_dir: Path, label: str) -> Path:
         size = path.stat().st_size if exists else 0
     except OSError as exc:
         raise RuntimeError(f"lip sync provider {label} cannot be read") from exc
+    try:
+        path.relative_to(output_dir)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"lip sync provider {label} is outside output_dir: {path}"
+        ) from exc
     if not exists or size <= 0:
         raise RuntimeError(f"lip sync provider {label} is missing or empty: {path}")
     return path
 
 
-def _read_provider_manifest(path: Path) -> tuple[dict, _ProviderProvenance]:
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise RuntimeError(f"cannot hash media artifact: {path}") from exc
+    return digest.hexdigest()
+
+
+def _manifest_alias(payload: dict, keys: tuple[str, ...], expected: str, label: str) -> None:
+    values = [payload[key] for key in keys if key in payload]
+    if not values or any(value != expected for value in values):
+        raise RuntimeError(f"lip sync provider manifest has invalid {label} provenance")
+
+
+def _manifest_path(value: object, expected: Path, label: str) -> None:
+    if not isinstance(value, str):
+        raise RuntimeError(f"lip sync provider manifest has invalid {label} path")
+    try:
+        path = Path(value)
+        if not path.is_absolute() or path.resolve() != expected:
+            raise ValueError
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"lip sync provider manifest has invalid {label} path"
+        ) from exc
+
+
+def _read_provider_manifest(
+    path: Path,
+    snapshot: _InputSnapshot,
+    inputs: _ValidatedInputs,
+    output_path: Path,
+    output_sha256: str,
+) -> tuple[dict, _ProviderProvenance]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -115,10 +185,13 @@ def _read_provider_manifest(path: Path) -> tuple[dict, _ProviderProvenance]:
         raise RuntimeError("lip sync provider manifest has invalid provider provenance")
     if not isinstance(provider_version, str) or not provider_version.strip():
         raise RuntimeError("lip sync provider manifest has invalid provider_version provenance")
-    if payload.get("model_name") != _MODEL_NAME:
-        raise RuntimeError("lip sync provider manifest has invalid model provenance")
-    if payload.get("workflow_name") != _WORKFLOW_NAME:
-        raise RuntimeError("lip sync provider manifest has invalid workflow provenance")
+    _manifest_alias(payload, ("model_name", "model"), _MODEL_NAME, "model")
+    _manifest_alias(
+        payload,
+        ("workflow_name", "workflow"),
+        _WORKFLOW_NAME,
+        "workflow",
+    )
 
     generation_time = payload.get("generation_time")
     if isinstance(generation_time, bool) or not isinstance(generation_time, (int, float)):
@@ -130,6 +203,48 @@ def _read_provider_manifest(path: Path) -> tuple[dict, _ProviderProvenance]:
     seed = payload.get("seed")
     if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
         raise RuntimeError("lip sync provider manifest has invalid seed provenance")
+
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        raise RuntimeError("lip sync provider manifest is missing request metadata")
+    if metadata.get("project_id") != snapshot.project_id:
+        raise RuntimeError("lip sync provider manifest project_id does not match request")
+    if metadata.get("shot_id") != snapshot.shot_id:
+        raise RuntimeError("lip sync provider manifest shot_id does not match request")
+    if metadata.get("input_assets") != [
+        snapshot.source_asset_id,
+        snapshot.audio_asset_id,
+    ]:
+        raise RuntimeError("lip sync provider manifest input_assets do not match request")
+
+    target_duration = payload.get("target_duration")
+    if (
+        isinstance(target_duration, bool)
+        or not isinstance(target_duration, Real)
+        or not math.isfinite(float(target_duration))
+        or abs(float(target_duration) - snapshot.shot_duration) > _TOLERANCE_EPSILON
+    ):
+        raise RuntimeError("lip sync provider manifest target_duration does not match request")
+
+    source_video = payload.get("source_video")
+    if not isinstance(source_video, dict):
+        raise RuntimeError("lip sync provider manifest is missing source_video provenance")
+    _manifest_path(source_video.get("path"), inputs.video_path, "source_video")
+    if source_video.get("sha256") != inputs.video_sha256:
+        raise RuntimeError("lip sync provider manifest source_video SHA256 does not match")
+
+    source_audio = payload.get("source_audio")
+    if not isinstance(source_audio, dict):
+        raise RuntimeError("lip sync provider manifest is missing source_audio provenance")
+    _manifest_path(source_audio.get("path"), inputs.audio_path, "source_audio")
+    if source_audio.get("sha256") != inputs.audio_sha256:
+        raise RuntimeError("lip sync provider manifest source_audio SHA256 does not match")
+
+    _manifest_path(payload.get("output_path"), output_path, "output")
+    if payload.get("output_sha256") != output_sha256:
+        raise RuntimeError("lip sync provider manifest output SHA256 does not match")
+    if "sha256" in payload and payload.get("sha256") != output_sha256:
+        raise RuntimeError("lip sync provider manifest SHA256 alias does not match output")
     return payload, _ProviderProvenance(
         provider_version=provider_version.strip(),
         generation_time=generation_time,
@@ -137,7 +252,7 @@ def _read_provider_manifest(path: Path) -> tuple[dict, _ProviderProvenance]:
     )
 
 
-def _validate_source(snapshot: _InputSnapshot) -> tuple[Path, Path]:
+def _validate_source(snapshot: _InputSnapshot) -> _ValidatedInputs:
     video_path = _input_file(snapshot.source_path, "source video")
     try:
         video = probe_video(video_path)
@@ -179,7 +294,12 @@ def _validate_source(snapshot: _InputSnapshot) -> tuple[Path, Path]:
             "source video is shorter than the Shot target or dialogue speech: "
             f"{source_coverage:.4f}s < {required_duration:.4f}s"
         )
-    return video_path, audio_path
+    return _ValidatedInputs(
+        video_path=video_path,
+        audio_path=audio_path,
+        video_sha256=_sha256(video_path),
+        audio_sha256=_sha256(audio_path),
+    )
 
 
 def _validate_output(path: Path, target_duration: float) -> AVInfo:
@@ -190,6 +310,15 @@ def _validate_output(path: Path, target_duration: float) -> AVInfo:
 
     video = media.video
     audio = media.audio
+    container_formats = {
+        value.strip().lower()
+        for value in media.format_name.split(",")
+        if value.strip()
+    }
+    if not container_formats.intersection(_MP4_MOV_FORMATS):
+        raise RuntimeError(
+            f"lip sync output must use an MP4/MOV-family container, got {media.format_name}"
+        )
     if video.codec != "h264":
         raise RuntimeError(f"lip sync output must be H.264, got {video.codec}")
     if video.pixel_format != "yuv420p":
@@ -281,8 +410,18 @@ def _snapshot_inputs(database_url: str, project_id: str, shot_id: str) -> _Input
         )
 
 
-def _assert_snapshot_unchanged(session, snapshot: _InputSnapshot) -> Shot:
-    shot = _owned_shot(session, snapshot.project_id, snapshot.shot_id)
+def _assert_snapshot_unchanged(
+    session,
+    snapshot: _InputSnapshot,
+    *,
+    lock_rows: bool = False,
+) -> Shot:
+    shot = _owned_shot(
+        session,
+        snapshot.project_id,
+        snapshot.shot_id,
+        for_update=lock_rows,
+    )
     if shot is None:
         raise RuntimeError("shot changed during lip sync generation")
     if (
@@ -298,7 +437,11 @@ def _assert_snapshot_unchanged(session, snapshot: _InputSnapshot) -> Shot:
     ):
         raise RuntimeError("shot changed during lip sync generation")
 
-    source = session.get(Asset, snapshot.source_asset_id)
+    source = _asset_by_id(
+        session,
+        snapshot.source_asset_id,
+        for_update=lock_rows,
+    )
     if (
         source is None
         or source.project_id != snapshot.project_id
@@ -307,12 +450,14 @@ def _assert_snapshot_unchanged(session, snapshot: _InputSnapshot) -> Shot:
     ):
         raise RuntimeError("source video asset changed during lip sync generation")
 
-    dialogues = (
+    dialogue_query = (
         session.query(Dialogue)
         .filter_by(shot_id=snapshot.shot_id)
         .order_by(Dialogue.order)
-        .all()
     )
+    if lock_rows:
+        dialogue_query = dialogue_query.with_for_update()
+    dialogues = dialogue_query.all()
     if len(dialogues) != 1:
         raise RuntimeError("dialogue changed during lip sync generation")
     dialogue = dialogues[0]
@@ -323,7 +468,11 @@ def _assert_snapshot_unchanged(session, snapshot: _InputSnapshot) -> Shot:
     ):
         raise RuntimeError("dialogue changed during lip sync generation")
 
-    audio = session.get(Asset, snapshot.audio_asset_id)
+    audio = _asset_by_id(
+        session,
+        snapshot.audio_asset_id,
+        for_update=lock_rows,
+    )
     if (
         audio is None
         or audio.project_id != snapshot.project_id
@@ -346,7 +495,7 @@ async def generate_shot_lipsync(
     if snapshot is None:
         return None
 
-    video_path, audio_path = _validate_source(snapshot)
+    inputs = _validate_source(snapshot)
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     metadata = {
@@ -357,8 +506,8 @@ async def generate_shot_lipsync(
     }
 
     result = await provider.generate(
-        video_path,
-        audio_path,
+        inputs.video_path,
+        inputs.audio_path,
         output_dir,
         metadata,
     )
@@ -366,7 +515,14 @@ async def generate_shot_lipsync(
         raise RuntimeError("lip sync provider did not return output and manifest paths")
     output_path = _provider_file(result[0], output_dir, "output")
     manifest_path = _provider_file(result[1], output_dir, "manifest")
-    _, provenance = _read_provider_manifest(manifest_path)
+    output_sha256 = _sha256(output_path)
+    _, provenance = _read_provider_manifest(
+        manifest_path,
+        snapshot,
+        inputs,
+        output_path,
+        output_sha256,
+    )
     media = _validate_output(output_path, snapshot.shot_duration)
 
     asset_metadata = {
@@ -377,10 +533,14 @@ async def generate_shot_lipsync(
         "workflow_name": _WORKFLOW_NAME,
         "generation_time": provenance.generation_time,
         "source_video_asset_id": snapshot.source_asset_id,
+        "source_video_sha256": inputs.video_sha256,
         "dialogue_id": snapshot.dialogue_id,
         "audio_asset_id": snapshot.audio_asset_id,
+        "source_audio_sha256": inputs.audio_sha256,
         "input_assets": [snapshot.source_asset_id, snapshot.audio_asset_id],
         "target_duration": snapshot.shot_duration,
+        "output_sha256": output_sha256,
+        "format_name": media.format_name,
         "duration": media.duration,
         "video_duration": media.video.duration,
         "audio_duration": media.audio.duration,
@@ -395,7 +555,14 @@ async def generate_shot_lipsync(
     }
 
     with session_scope(database_url) as session:
-        shot = _assert_snapshot_unchanged(session, snapshot)
+        is_sqlite = session.get_bind().dialect.name == "sqlite"
+        if is_sqlite:
+            session.execute(text("BEGIN IMMEDIATE"))
+        shot = _assert_snapshot_unchanged(
+            session,
+            snapshot,
+            lock_rows=not is_sqlite,
+        )
         asset = Asset(
             project_id=project_id,
             kind="LIPSYNC",
