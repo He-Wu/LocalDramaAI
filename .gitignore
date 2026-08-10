@@ -48,3 +48,7 @@ storage/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Local agent workspaces and brainstorming artifacts
+.worktrees/
+.superpowers/
