@@ -91,6 +91,13 @@ def test_model_downloads_use_official_pinned_repositories_and_hash_every_file():
         assert filename in download
     assert "Get-FileHash" in download
     assert "model-hashes.json" in download
+    assert "curl.exe" in download
+    assert "--location" in download
+    assert "--continue-at" in download
+    assert ".download" in download
+    assert "Move-Item" in download
+    assert "/resolve/" in download
+    assert "?download=true" in download
     assert "env-tts" not in download
     assert "env-comfyui" not in download
 

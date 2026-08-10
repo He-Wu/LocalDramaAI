@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [string]$Root = 'E:\LocalDramaAI'
+    [string]$Root = 'E:\LocalDramaAI',
+    [string]$HuggingFaceEndpoint = 'https://huggingface.co'
 )
 
 Set-StrictMode -Version Latest
@@ -10,18 +11,7 @@ $env:PYTHONIOENCODING = 'utf-8'
 
 $repository = Join-Path $Root 'MuseTalk'
 $models = Join-Path $repository 'models'
-$environment = Join-Path $Root 'env-musetalk'
-$python = Join-Path $environment 'Scripts\python.exe'
-$huggingFace = Join-Path $environment 'Scripts\huggingface-cli.exe'
-if (-not (Test-Path -LiteralPath $huggingFace)) {
-    $huggingFace = Join-Path $environment 'Scripts\hf.exe'
-}
-if (-not (Test-Path -LiteralPath $python)) {
-    throw "Run setup_musetalk.ps1 first; Python is missing: $python"
-}
-if (-not (Test-Path -LiteralPath $huggingFace)) {
-    throw "Hugging Face CLI is missing from env-musetalk: $huggingFace"
-}
+$curl = (Get-Command curl.exe -CommandType Application -ErrorAction Stop).Source
 if (-not (Test-Path -LiteralPath (Join-Path $repository '.git'))) {
     throw "Official MuseTalk checkout is missing: $repository"
 }
@@ -72,18 +62,69 @@ $downloads = @(
 )
 
 New-Item -ItemType Directory -Path $models -Force | Out-Null
+$manifest = Join-Path $models 'model-hashes.json'
+$verifiedRecords = @{}
+if (Test-Path -LiteralPath $manifest -PathType Leaf) {
+    try {
+        foreach ($record in @(Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json)) {
+            $verifiedRecords[[string]$record.path] = $record
+        }
+    }
+    catch {
+        Write-Warning "Ignoring unreadable existing model hash manifest: $manifest"
+    }
+}
+
 foreach ($download in $downloads) {
-    New-Item -ItemType Directory -Path $download.LocalDirectory -Force | Out-Null
-    $arguments = @(
-        'download',
-        $download.Repository,
-        '--revision', $download.Revision,
-        '--local-dir', $download.LocalDirectory,
-        '--include'
-    ) + $download.Include
-    & $huggingFace @arguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "Hugging Face download failed for $($download.Repository) at $($download.Revision)"
+    for ($index = 0; $index -lt $download.Include.Count; $index++) {
+        $sourcePath = $download.Include[$index]
+        $relativePath = $download.Expected[$index]
+        $destination = Join-Path $models $relativePath
+        $manifestPath = [System.IO.Path]::GetRelativePath($repository, $destination).Replace('\', '/')
+        $record = $verifiedRecords[$manifestPath]
+        $cached = $false
+        if ($null -ne $record -and
+            $record.repository -eq $download.Repository -and
+            $record.revision -eq $download.Revision -and
+            (Test-Path -LiteralPath $destination -PathType Leaf)) {
+            $file = Get-Item -LiteralPath $destination
+            if ($file.Length -eq [long]$record.bytes) {
+                $hash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
+                $cached = $hash -eq [string]$record.sha256
+            }
+        }
+        if ($cached) {
+            Write-Host "Using verified cached model: $manifestPath"
+            continue
+        }
+
+        $destinationDirectory = Split-Path -Parent $destination
+        New-Item -ItemType Directory -Path $destinationDirectory -Force | Out-Null
+        $partial = "$destination.$($download.Revision).download"
+        $encodedSegments = @($sourcePath -split '/' | ForEach-Object { [Uri]::EscapeDataString($_) })
+        $encodedPath = $encodedSegments -join '/'
+        $url = "$($HuggingFaceEndpoint.TrimEnd('/'))/$($download.Repository)/resolve/$($download.Revision)/${encodedPath}?download=true"
+        $arguments = @(
+            '--fail',
+            '--location',
+            '--show-error',
+            '--retry', '5',
+            '--retry-delay', '2',
+            '--retry-all-errors',
+            '--connect-timeout', '30',
+            '--continue-at', '-',
+            '--output', $partial,
+            $url
+        )
+        & $curl @arguments
+        if ($LASTEXITCODE -ne 0) {
+            throw "Official model download failed for $($download.Repository)/$sourcePath at $($download.Revision); partial file retained at $partial"
+        }
+        if (-not (Test-Path -LiteralPath $partial -PathType Leaf) -or
+            (Get-Item -LiteralPath $partial).Length -le 0) {
+            throw "Official model download produced an empty file: $partial"
+        }
+        Move-Item -LiteralPath $partial -Destination $destination -Force
     }
 }
 
@@ -124,7 +165,6 @@ foreach ($download in $downloads) {
     }
 }
 
-$manifest = Join-Path $models 'model-hashes.json'
 $temporaryManifest = "$manifest.tmp"
 $hashRecords | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $temporaryManifest -Encoding utf8
 Move-Item -LiteralPath $temporaryManifest -Destination $manifest -Force
