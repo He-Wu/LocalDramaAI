@@ -27,7 +27,7 @@ class OllamaProvider:
         schema = StructuredDrama.model_json_schema()
         payload = {"model": self.model, "stream": False, "keep_alive": 0, "options": {"temperature": 0, "num_predict": 1024},
                    "format": schema,
-                   "messages": [{"role": "system", "content": "只输出符合 JSON Schema 的中文短剧结构，不要 Markdown。characters、scenes、shots、dialogues 四个数组都必须至少有一个元素；shots 使用全剧扁平镜头列表，dialogues 的 shot_order 必须对应镜头。"},
+                   "messages": [{"role": "system", "content": "只输出符合 JSON Schema 的中文短剧结构，不要 Markdown。characters、scenes、shots、dialogues 四个数组都必须至少有一个元素；每个 character 必须给出 name、age、gender、face、eyes、nose、mouth、hair、body、clothes、accessories、visual_style、personality；shots 使用全剧扁平镜头列表，每个 shot 必须给出 shots.scene_order 和 shots.character_name；dialogues 的 shot_order 必须对应镜头。"},
                                 {"role": "user", "content": story}]}
         async with await self._client() as client:
             last_error = None

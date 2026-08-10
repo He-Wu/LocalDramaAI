@@ -2,8 +2,17 @@ from pydantic import BaseModel, Field
 
 class CharacterSpec(BaseModel):
     name: str
+    age: str = "成年"
     gender: str = "未知"
-    appearance: str = ""
+    face: str = "自然脸型"
+    eyes: str = "自然眼型"
+    nose: str = ""
+    mouth: str = ""
+    hair: str = "自然发型"
+    body: str = "自然体型"
+    clothes: str = "日常服装"
+    accessories: str = ""
+    visual_style: str = "写实"
     personality: str = ""
 
 class DialogueSpec(BaseModel):
@@ -14,6 +23,8 @@ class DialogueSpec(BaseModel):
 
 class ShotSpec(BaseModel):
     order: int
+    scene_order: int = Field(default=1, ge=1)
+    character_name: str | None = None
     title: str
     description: str
     shot_type: str = "ACTION"
@@ -31,6 +42,7 @@ class SceneSpec(BaseModel):
     location: str = ""
     time_of_day: str = "白天"
     mood: str = ""
+    estimated_duration: float | None = Field(default=None, ge=0)
     shots: list[ShotSpec] = Field(default_factory=list)
 
 class StructuredDrama(BaseModel):
