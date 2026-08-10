@@ -1,0 +1,66 @@
+app:
+  python: "3.13.3"
+  fastapi: "0.133.1"
+  uvicorn: "0.41.0"
+  sqlalchemy: "2.0.51"
+  pydantic: "2.12.5"
+  httpx: "0.28.1"
+comfyui:
+  repository: "https://github.com/Comfy-Org/ComfyUI"
+  commit: "cbbc9dab1f03d0d9a6caa8a8be7d77a7e37e1e44"
+  version: "0.31.0"
+  python: "3.12.4"
+  torch: "2.13.0+cu126"
+  cuda_runtime: "12.6"
+  launch_args: "main.py --listen 127.0.0.1 --port 8188 --disable-auto-launch"
+ollama:
+  version: "0.32.3"
+  model: "qwen2.5:0.5b"
+qwen3_tts:
+  repository: "https://github.com/QwenLM/Qwen3-TTS"
+  package: "qwen-tts==0.1.1"
+  model_repository: "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+  model_commit: "5d83992436eae1d760afd27aff78a71d676296fc"
+  model: "E:/LocalDramaAI/Models/Qwen3-TTS-12Hz-0.6B-Base"
+  model_sha256: "180b3b10eb1c9f1b4db7806d5475bae3071c0243c299d49926bab1da3b6946f6"
+  tokenizer_commit: "7dd38ad4e9bad454aae9cd937d0cd577604fe229"
+  tokenizer_sha256: "836b7b357f5ea43e889936a3709af68dfe3751881acefe4ecf0dbd30ba571258"
+  python: "3.12.4"
+  torch: "2.13.0+cu126"
+  cuda_runtime: "12.6"
+  transformers: "4.57.3"
+  accelerate: "1.12.0"
+  launch_args: "-m uvicorn ai_services.qwen3_tts.service:app --host 127.0.0.1 --port 8020"
+musetalk:
+  repository: null
+  commit_or_release: null
+  model_version: null
+ffmpeg:
+  version: "8.1"
+wan_video:
+  workflow: "wan22_i2v_5b_api"
+  model: "E:/LocalDramaAI/model-staging-wan22/main/split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors"
+  model_sha256: "456f901338bd9eadbded3828b819109a9b68e8a525ca5cf8d0049a69fcfeca1e"
+  vae: "E:/LocalDramaAI/ComfyUI/models/vae/wan2.2_vae.safetensors"
+  vae_sha256: "e40321bd36b9709991dae2530eb4ac303dd168276980d3e9bc4b6e2b75fed156"
+  text_encoder: "E:/LocalDramaAI/model-staging-wan22/text/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+  text_encoder_sha256: "c3355d30191f1f066b26d93fba017ae9809dce6c627dda5f6a66eaa651204f68"
+  profile: "640x368, 49 frames, 16 fps"
+verification:
+  phase: "7"
+  comfyui_verified: true
+  phase3_image: "E:/LocalDramaAI/Storage/phase3/phase3_smoke_00002_.png"
+  phase4_master: "E:/LocalDramaAI/Storage/phase4/1786252381/characters/master_00001_.png"
+  phase4_storyboards:
+    - "E:/LocalDramaAI/Storage/phase4/1786252381/storyboards/7f54fb7f-aa4c-43aa-abba-859a370ca324_00001_.png"
+    - "E:/LocalDramaAI/Storage/phase4/1786252381/storyboards/f22792b6-33ed-437d-be38-d73124ed84cc_00001_.png"
+  phase5_video: "E:/kang/github/Movie/artifacts/phase5/1786277293/phase5_00002_.mp4"
+  phase5_video_sha256: "8382967b7b092afa3a1948d1374b0e94496db7bf90c83c0233af7c57ee10b87e"
+  phase5_database: "E:/kang/github/Movie/.runtime/phase5/phase5-smoke-1786277293.db"
+  phase6_audio: "E:/kang/github/Movie/artifacts/phase6/1786296246/2c52e8d6-5b98-4c42-86fa-42831efdb38f.wav"
+  phase6_audio_sha256: "ea83c367656f532c9d790b6f7415ffcd6568562a13d86b757e0fb144d0966eb9"
+  phase6_database: "E:/kang/github/Movie/.runtime/phase6/phase6-smoke-1786296246.db"
+  phase7_audio: "E:/kang/github/Movie/artifacts/phase7/1786342910/audio/79002d71-d985-4658-aa8e-f30731dc0291.wav"
+  phase7_video: "E:/kang/github/Movie/artifacts/phase7/1786342910/video/0753ed98-8ccc-4c4c-99dc-f9fc96b822ac_00001_.mp4"
+  phase7_video_sha256: "009cf772e2ba8f36604cc7f72c6799c15f093699aecb51c8cbea89f1db9a95f6"
+  phase7_database: "E:/kang/github/Movie/.runtime/phase7/phase7-smoke-1786342910.db"

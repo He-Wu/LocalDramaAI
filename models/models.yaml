@@ -1,0 +1,69 @@
+models:
+  - id: sd15-ema-fp16
+    name: Stable Diffusion 1.5 EMA FP16
+    type: image
+    provider: comfyui
+    version: archive
+    path: E:/LocalDramaAI/ComfyUI/models/checkpoints/v1-5-pruned-emaonly-fp16.safetensors
+    precision: fp16
+    quantization: null
+    workflow: sd15_smoke
+    source: https://huggingface.co/Comfy-Org/stable-diffusion-v1-5-archive
+    license: CreativeML Open RAIL-M
+    enabled: true
+    exclusive_gpu: false
+    notes: Phase 3 smoke checkpoint; not a final production-quality model.
+  - id: wan22-ti2v-5b-fp16
+    name: Wan2.2 TI2V 5B FP16
+    type: video
+    provider: comfyui
+    version: repackaged
+    path: E:/LocalDramaAI/model-staging-wan22/main/split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors
+    precision: fp16
+    quantization: null
+    workflow: wan22_i2v_5b_api
+    source: https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged
+    license: Apache-2.0
+    enabled: true
+    exclusive_gpu: true
+    notes: Phase 5 storyboard-to-video MVP; requires the matching Wan2.2 VAE and UMT5 encoder.
+  - id: wan22-vae
+    name: Wan2.2 VAE
+    type: vae
+    provider: comfyui
+    version: repackaged
+    path: E:/LocalDramaAI/ComfyUI/models/vae/wan2.2_vae.safetensors
+    precision: fp16
+    quantization: null
+    workflow: wan22_i2v_5b_api
+    source: https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged
+    license: Apache-2.0
+    enabled: true
+    exclusive_gpu: true
+  - id: umt5-xxl-fp8
+    name: UMT5 XXL FP8 Scaled
+    type: text_encoder
+    provider: comfyui
+    version: repackaged
+    path: E:/LocalDramaAI/model-staging-wan22/text/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors
+    precision: fp8
+    quantization: scaled
+    workflow: wan22_i2v_5b_api
+    source: https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged
+    license: Apache-2.0
+    enabled: true
+    exclusive_gpu: true
+  - id: qwen3-tts-12hz-06b-base
+    name: Qwen3-TTS 12Hz 0.6B Base
+    type: tts
+    provider: qwen3-tts
+    version: "0.1.1"
+    path: E:/LocalDramaAI/Models/Qwen3-TTS-12Hz-0.6B-Base
+    precision: bfloat16
+    quantization: null
+    workflow: qwen3_tts_voice_clone
+    source: https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base
+    license: Apache-2.0
+    enabled: true
+    exclusive_gpu: true
+    notes: Phase 6 verified voice-clone model; explicit unload is required before Wan video jobs.

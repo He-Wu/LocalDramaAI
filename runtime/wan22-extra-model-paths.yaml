@@ -1,0 +1,14 @@
+wan22_diffusion:
+  base_path: E:/LocalDramaAI/model-staging-wan22/main
+  is_default: true
+  diffusion_models: split_files/diffusion_models
+
+wan22_text_encoder:
+  base_path: E:/LocalDramaAI/model-staging-wan22/text
+  is_default: true
+  text_encoders: split_files/text_encoders
+
+wan22_vae:
+  base_path: E:/LocalDramaAI/ComfyUI/models
+  is_default: true
+  vae: vae

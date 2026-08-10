@@ -1,0 +1,50 @@
+# Python caches and environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env-*/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Runtime state and generated outputs
+.runtime/
+artifacts/
+logs/
+storage/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+
+# Large AI models and generated media
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.gguf
+*.wav
+*.mp3
+*.flac
+*.mp4
+*.webm
+*.mkv
+*.mov
+
+# Editors and operating system
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini

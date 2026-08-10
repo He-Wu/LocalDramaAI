@@ -1,0 +1,6 @@
+version: "1"
+workflow: sd15_smoke.json
+bindings:
+  MODEL: v1-5-pruned-emaonly-fp16.safetensors
+  width: 512
+  height: 512

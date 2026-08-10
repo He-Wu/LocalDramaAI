@@ -1,0 +1,1 @@
+Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'uvicorn app.main:app|app.worker_main|uvicorn ai_services.qwen3_tts.service:app' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
