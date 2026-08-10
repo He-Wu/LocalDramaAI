@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import String, Text, Integer, Float, Boolean, ForeignKey
+from sqlalchemy import String, Text, Integer, Float, Boolean, ForeignKey, false
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .base import Base, TimestampMixin
 
@@ -18,6 +18,16 @@ class Shot(Base, TimestampMixin):
     negative_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
     storyboard_asset_id: Mapped[str | None] = mapped_column(ForeignKey("assets.id", ondelete="SET NULL"), nullable=True)
     video_asset_id: Mapped[str | None] = mapped_column(ForeignKey("assets.id", ondelete="SET NULL"), nullable=True)
+    requires_lip_sync: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
+    speaker_visible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
+    lipsync_asset_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "assets.id",
+            name="fk_shots_lipsync_asset_id_assets",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
     status: Mapped[str] = mapped_column(String(30), default="DRAFT")
     scene = relationship("Scene", back_populates="shots")
     dialogues = relationship("Dialogue", back_populates="shot", cascade="all, delete-orphan", order_by="Dialogue.order")
