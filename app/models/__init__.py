@@ -1,6 +1,7 @@
 from .base import Base
 from .project import Project
 from .job import GenerationJob
+from .job_stage import JobStage
 from .job_event import JobEvent
 from .asset import Asset
 from .generation import GenerationManifest

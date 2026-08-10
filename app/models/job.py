@@ -22,5 +22,7 @@ class GenerationJob(Base, TimestampMixin):
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     project = relationship("Project", back_populates="jobs")
     events = relationship("JobEvent", back_populates="job", cascade="all, delete-orphan", order_by="JobEvent.sequence")
+    stages = relationship("JobStage", back_populates="job", cascade="all, delete-orphan", order_by="JobStage.created_at")
