@@ -32,6 +32,11 @@ def create_schema(database_url: str):
     from app import models  # noqa: F401
     Base.metadata.create_all(get_engine(database_url))
 
+def initialize_database(database_url: str):
+    create_schema(database_url)
+    from app.db.migrations import upgrade_schema
+    upgrade_schema(database_url)
+
 @contextmanager
 def session_scope(database_url: str):
     session = sessionmaker(bind=get_engine(database_url), expire_on_commit=False, future=True)()

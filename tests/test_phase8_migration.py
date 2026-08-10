@@ -1,4 +1,5 @@
 import sqlite3
+import warnings
 
 from sqlalchemy import create_engine, inspect, text
 
@@ -7,38 +8,7 @@ from app.models import Project, Scene, Shot
 from app.schemas.drama import ShotSpec
 
 
-def test_phase8_shot_defaults_are_false(tmp_path):
-    database = str(tmp_path / "phase8.db")
-    create_schema(database)
-
-    with session_scope(database) as session:
-        project = Project(name="Phase 8")
-        session.add(project)
-        session.flush()
-        scene = Scene(project_id=project.id, order=1, title="Scene", description="Description")
-        session.add(scene)
-        session.flush()
-        shot = Shot(scene_id=scene.id, order=1, title="Shot", description="Description")
-        session.add(shot)
-        session.flush()
-        shot_id = shot.id
-
-    with session_scope(database) as session:
-        shot = session.get(Shot, shot_id)
-        assert shot.requires_lip_sync is False
-        assert shot.speaker_visible is False
-        assert shot.lipsync_asset_id is None
-
-
-def test_phase8_shot_spec_defaults_are_false():
-    shot = ShotSpec(order=1, title="Shot", description="Description")
-
-    assert shot.requires_lip_sync is False
-    assert shot.speaker_visible is False
-
-
-def test_phase7_database_upgrades_without_losing_video_link(tmp_path):
-    database = tmp_path / "phase7.db"
+def _create_phase7_database(database):
     with sqlite3.connect(database) as connection:
         connection.executescript(
             """
@@ -77,11 +47,8 @@ def test_phase7_database_upgrades_without_losing_video_link(tmp_path):
             ("shot-1", "scene-1", "video-asset-1"),
         )
 
-    from app.db.migrations import upgrade_schema
 
-    upgrade_schema(str(database))
-    upgrade_schema(f"sqlite:///{database.as_posix()}")
-
+def _assert_phase8_shot_schema(database):
     engine = create_engine(f"sqlite:///{database.as_posix()}")
     try:
         inspector = inspect(engine)
@@ -121,3 +88,76 @@ def test_phase7_database_upgrades_without_losing_video_link(tmp_path):
         }
     finally:
         engine.dispose()
+
+
+def test_phase8_shot_defaults_are_false(tmp_path):
+    database = str(tmp_path / "phase8.db")
+    create_schema(database)
+
+    with session_scope(database) as session:
+        project = Project(name="Phase 8")
+        session.add(project)
+        session.flush()
+        scene = Scene(project_id=project.id, order=1, title="Scene", description="Description")
+        session.add(scene)
+        session.flush()
+        shot = Shot(scene_id=scene.id, order=1, title="Shot", description="Description")
+        session.add(shot)
+        session.flush()
+        shot_id = shot.id
+
+    with session_scope(database) as session:
+        shot = session.get(Shot, shot_id)
+        assert shot.requires_lip_sync is False
+        assert shot.speaker_visible is False
+        assert shot.lipsync_asset_id is None
+
+
+def test_phase8_shot_spec_defaults_are_false():
+    shot = ShotSpec(order=1, title="Shot", description="Description")
+
+    assert shot.requires_lip_sync is False
+    assert shot.speaker_visible is False
+
+
+def test_phase7_database_upgrades_without_losing_video_link(tmp_path):
+    database = tmp_path / "phase7.db"
+    _create_phase7_database(database)
+
+    from app.db.migrations import upgrade_schema
+
+    upgrade_schema(str(database))
+    upgrade_schema(f"sqlite:///{database.as_posix()}")
+
+    _assert_phase8_shot_schema(database)
+
+
+def test_initialize_database_upgrades_phase7_database(tmp_path):
+    database = tmp_path / "phase7-bootstrap.db"
+    _create_phase7_database(database)
+
+    from app.db.session import initialize_database
+
+    initialize_database(str(database))
+    initialize_database(f"sqlite:///{database.as_posix()}")
+
+    _assert_phase8_shot_schema(database)
+
+
+def test_api_and_worker_startups_initialize_database(monkeypatch):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        import app.main as api_main
+    import app.worker_main as worker_main
+
+    initialized_urls = []
+    monkeypatch.setattr(api_main, "initialize_database", initialized_urls.append)
+    monkeypatch.setattr(worker_main, "initialize_database", initialized_urls.append)
+
+    api_main.startup()
+    worker_main.startup()
+
+    assert initialized_urls == [
+        api_main.settings.database_url,
+        worker_main.settings.database_url,
+    ]
