@@ -1,12 +1,19 @@
+import asyncio
+import hashlib
+import io
 import json
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
+import httpx
 import pytest
 import yaml
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from ai_services.musetalk import service
 from ai_services.musetalk.service import (
@@ -26,6 +33,21 @@ from ai_services.musetalk.service import (
     write_inference_config,
 )
 from app.services.media_probe import AVInfo, AudioStreamInfo, VideoStreamInfo
+
+
+REQUIRED_MODEL_PATHS = (
+    "models/musetalkV15/unet.pth",
+    "models/musetalkV15/musetalk.json",
+    "models/sd-vae/config.json",
+    "models/sd-vae/diffusion_pytorch_model.bin",
+    "models/whisper/config.json",
+    "models/whisper/pytorch_model.bin",
+    "models/whisper/preprocessor_config.json",
+    "models/dwpose/dw-ll_ucoco_384.pth",
+    "models/syncnet/latentsync_syncnet.pt",
+    "models/face-parse-bisent/79999_iter.pth",
+    "models/face-parse-bisent/resnet18-5c106cde.pth",
+)
 
 
 def _ffmpeg(path: Path, *arguments: str) -> Path:
@@ -91,6 +113,10 @@ def _settings(tmp_path: Path) -> MuseTalkSettings:
     )
 
 
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def _request(tmp_path: Path, **overrides) -> GenerateRequest:
     video = tmp_path / "source.mp4"
     audio = tmp_path / "source.wav"
@@ -105,6 +131,11 @@ def _request(tmp_path: Path, **overrides) -> GenerateRequest:
         "target_duration": 0.4,
         "batch_size": 4,
         "use_float16": True,
+        "metadata": {
+            "project_id": "project-default",
+            "shot_id": "shot-default",
+            "input_assets": ["video-asset", "audio-asset"],
+        },
     }
     values.update(overrides)
     return GenerateRequest(**values)
@@ -116,7 +147,6 @@ def _request(tmp_path: Path, **overrides) -> GenerateRequest:
         ({"video_path": "relative.mp4"}, "video_path must be absolute"),
         ({"audio_path": ""}, "audio_path must not be empty"),
         ({"output_dir": "relative-output"}, "output_dir must be absolute"),
-        ({"target_duration": 0}, "target_duration must be positive"),
         ({"batch_size": 8}, "batch_size must be exactly 4"),
         ({"use_float16": False}, "use_float16 must be true"),
     ],
@@ -151,6 +181,59 @@ def test_generate_validation_requires_source_mp4_and_wav_paths(tmp_path):
         validate_generate_request(_request(tmp_path, video_path=str(wrong_video)))
     with pytest.raises(ValueError, match="audio_path must be a WAV"):
         validate_generate_request(_request(tmp_path, audio_path=str(wrong_audio)))
+
+
+@pytest.mark.parametrize(
+    "invalid_duration",
+    ["0.4", True, 1, 0.0, -1.0, float("inf"), float("nan")],
+)
+def test_generate_model_rejects_coerced_target_duration(tmp_path, invalid_duration):
+    with pytest.raises(ValidationError):
+        _request(tmp_path, target_duration=invalid_duration)
+
+
+def test_generate_model_requires_metadata_to_be_an_object(tmp_path):
+    with pytest.raises(ValidationError):
+        _request(tmp_path, metadata=[{"project_id": "project-1"}])
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"project_id": "project", "shot_id": "shot"},
+        {
+            "project_id": "project",
+            "shot_id": "shot",
+            "input_assets": ["video", "audio"],
+            "unexpected": "value",
+        },
+        {"project_id": 7, "shot_id": "shot", "input_assets": ["video", "audio"]},
+        {"project_id": "project", "shot_id": "shot", "input_assets": "video"},
+        {"project_id": "project", "shot_id": "shot", "input_assets": ["video"]},
+        {
+            "project_id": "project",
+            "shot_id": "shot",
+            "input_assets": ["video", "audio", "extra"],
+        },
+        {"project_id": "project", "shot_id": "shot", "input_assets": ["video", 8]},
+    ],
+)
+def test_generate_model_requires_exact_binding_metadata_shape(tmp_path, metadata):
+    with pytest.raises(ValidationError):
+        _request(tmp_path, metadata=metadata)
+
+
+def test_generate_model_preserves_ordered_binding_metadata(tmp_path):
+    metadata = {
+        "project_id": "project",
+        "shot_id": "shot",
+        "input_assets": ["source-video", "dialogue-audio"],
+    }
+
+    request = _request(tmp_path, metadata=metadata)
+
+    assert request.metadata == metadata
+    assert request.metadata["input_assets"] == ["source-video", "dialogue-audio"]
 
 
 def test_job_directories_and_published_names_are_unique(tmp_path):
@@ -212,17 +295,44 @@ def test_command_builder_returns_exact_official_arguments(tmp_path):
     ]
 
 
+def test_service_lock_pins_official_musetalk_dependency_compatibility():
+    lock_path = Path(service.__file__).with_name("requirements.lock.txt")
+    pins = {
+        line.strip()
+        for line in lock_path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+
+    assert "pydantic==2.11.10" in pins
+    assert "typer==0.15.4" in pins
+    assert "rich==13.4.2" in pins
+    assert "pydantic==2.12.5" not in pins
+
+
 class _FakeChild:
-    def __init__(self, *, returncode=0, output="ok", timeout=False):
+    def __init__(self, *, returncode=0, output="ok", timeout=False, wait_error=None):
         self.returncode = returncode
-        self.output = output
+        self.stdout = io.StringIO(output)
         self.timeout = timeout
+        self.wait_error = wait_error
         self.killed = False
+        self.waited = False
+        self.communicate_calls = 0
 
     def communicate(self, timeout):
+        self.communicate_calls += 1
+        raise AssertionError("communicate() must not buffer unbounded child output")
+
+    def wait(self, timeout=None):
+        if self.wait_error is not None and not self.killed:
+            raise self.wait_error
         if self.timeout and not self.killed:
             raise subprocess.TimeoutExpired("musetalk", timeout)
-        return self.output, None
+        self.waited = True
+        return self.returncode
+
+    def poll(self):
+        return self.returncode if self.killed or self.waited else None
 
     def kill(self):
         self.killed = True
@@ -247,6 +357,38 @@ def test_command_execution_uses_list_cwd_shell_false_and_bounded_log(tmp_path, m
     assert seen["shell"] is False
     assert seen["text"] is True
     assert log.read_text(encoding="utf-8") == "x" * 100
+    assert service.active_child is None
+
+
+def test_command_execution_incrementally_keeps_only_fixed_log_tail(tmp_path, monkeypatch):
+    output = "discard-me\n" * (service.MAX_LOG_CHARS // 5) + "final-tail"
+    child = _FakeChild(output=output)
+    monkeypatch.setattr(service, "_spawn_child", lambda *args, **kwargs: child)
+    log = tmp_path / "bounded.log"
+
+    run_musetalk_command(["python"], cwd=tmp_path, timeout=2, log_path=log)
+
+    retained = log.read_text(encoding="utf-8")
+    assert retained == output[-service.MAX_LOG_CHARS :]
+    assert len(retained) == service.MAX_LOG_CHARS
+    assert retained.endswith("final-tail")
+    assert child.communicate_calls == 0
+
+
+class _Cancelled(BaseException):
+    pass
+
+
+def test_command_execution_kills_child_and_flushes_log_on_cancellation(tmp_path, monkeypatch):
+    child = _FakeChild(output="last output", wait_error=_Cancelled())
+    monkeypatch.setattr(service, "_spawn_child", lambda *args, **kwargs: child)
+    log = tmp_path / "cancelled.log"
+
+    with pytest.raises(_Cancelled):
+        run_musetalk_command(["python"], cwd=tmp_path, timeout=2, log_path=log)
+
+    assert child.killed is True
+    assert log.read_text(encoding="utf-8") == "last output"
     assert service.active_child is None
 
 
@@ -304,11 +446,31 @@ def test_zero_exit_without_expected_output_is_failure_and_publishes_nothing(tmp_
     assert not list(output.glob(".musetalk-job-*"))
 
 
+def test_generation_cleans_job_when_tool_resolution_fails(tmp_path, monkeypatch):
+    request = _request(tmp_path)
+
+    def fail_resolution(*args, **kwargs):
+        raise OSError("cannot inspect FFmpeg")
+
+    monkeypatch.setattr(service, "_resolve_tool", fail_resolution)
+
+    with pytest.raises(OSError, match="cannot inspect FFmpeg"):
+        run_generation(request, _settings(tmp_path))
+
+    assert not list(Path(request.output_dir).glob(".musetalk-job-*"))
+
+
 def test_happy_stub_creates_canonical_av_and_atomic_manifest(tmp_path):
+    caller_metadata = {
+        "project_id": "project-42",
+        "shot_id": "shot-7",
+        "input_assets": ["source-video-asset", "dialogue-audio-asset"],
+    }
     request = _request(
         tmp_path,
         video_path=str(_video(tmp_path / "source.mp4").resolve()),
         audio_path=str(_audio(tmp_path / "source.wav").resolve()),
+        metadata=caller_metadata,
     )
     seen = {}
 
@@ -341,11 +503,70 @@ def test_happy_stub_creates_canonical_av_and_atomic_manifest(tmp_path):
     assert manifest["model"] == "musetalk-v1.5"
     assert manifest["workflow"] == "musetalk_lipsync"
     assert manifest["batch_size"] == 4 and manifest["fp16"] is True
-    assert manifest["sha256"] == response["sha256"]
+    assert manifest["metadata"] == caller_metadata
+    assert manifest["metadata"]["project_id"] == "project-42"
+    assert manifest["metadata"]["shot_id"] == "shot-7"
+    assert manifest["metadata"]["input_assets"] == [
+        "source-video-asset",
+        "dialogue-audio-asset",
+    ]
+    assert manifest["target_duration"] == request.target_duration
+    source_video = Path(request.video_path).resolve()
+    source_audio = Path(request.audio_path).resolve()
+    assert manifest["source_video"] == {
+        "path": str(source_video),
+        "sha256": _sha256(source_video),
+    }
+    assert manifest["source_audio"] == {
+        "path": str(source_audio),
+        "sha256": _sha256(source_audio),
+    }
+    assert (
+        manifest["sha256"]
+        == manifest["output_sha256"]
+        == response["sha256"]
+        == _sha256(output)
+    )
+    assert Path(manifest["output_path"]).is_absolute()
+    assert set(manifest["inference_config"]) == {"task_0"}
+    assert Path(manifest["inference_config"]["task_0"]["video_path"]).name == "video.mp4"
+    assert Path(manifest["inference_config"]["task_0"]["audio_path"]).name == "audio.wav"
     assert manifest["command"] == seen["command"]
     assert not list(Path(request.output_dir).glob(".musetalk-job-*"))
     assert not list(Path(request.output_dir).glob("*.tmp.mp4"))
     assert not list(Path(request.output_dir).glob("*.tmp.json"))
+
+
+def test_generation_passes_resolved_path_ffmpeg_parent_to_official_cli(tmp_path):
+    request = _request(
+        tmp_path,
+        video_path=str(_video(tmp_path / "source.mp4").resolve()),
+        audio_path=str(_audio(tmp_path / "source.wav").resolve()),
+    )
+    settings = _settings(tmp_path)
+    settings = MuseTalkSettings(
+        repo_path=settings.repo_path,
+        python_executable=settings.python_executable,
+        ffmpeg_bin=tmp_path / "configured-but-missing",
+        timeout_seconds=settings.timeout_seconds,
+        repo_commit=settings.repo_commit,
+    )
+    resolved_parent = Path(shutil.which("ffmpeg") or "ffmpeg").parent
+    seen = {}
+
+    def fake_runner(command, **kwargs):
+        seen["command"] = command
+        task_path = Path(command[command.index("--inference_config") + 1])
+        task = yaml.safe_load(task_path.read_text(encoding="utf-8"))["task_0"]
+        result_dir = Path(command[command.index("--result_dir") + 1])
+        upstream = expected_musetalk_output(result_dir)
+        upstream.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(task["video_path"], upstream)
+
+    run_generation(request, settings, command_runner=fake_runner)
+
+    command = seen["command"]
+    assert Path(command[command.index("--ffmpeg_path") + 1]) == resolved_parent
 
 
 def test_invalid_upstream_never_leaves_partial_publication(tmp_path):
@@ -389,14 +610,13 @@ def _ready_layout(tmp_path: Path) -> MuseTalkSettings:
         timeout_seconds=5,
         repo_commit="abc123",
     )
-    for path in (
+    base_paths = (
         settings.python_executable,
         settings.ffmpeg_bin / "ffmpeg.exe",
         settings.ffmpeg_bin / "ffprobe.exe",
         settings.repo_path / "scripts" / "inference.py",
-        settings.repo_path / "models" / "musetalkV15" / "unet.pth",
-        settings.repo_path / "models" / "musetalkV15" / "musetalk.json",
-    ):
+    )
+    for path in (*base_paths, *(settings.repo_path / relative for relative in REQUIRED_MODEL_PATHS)):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"x")
     return settings
@@ -404,7 +624,11 @@ def _ready_layout(tmp_path: Path) -> MuseTalkSettings:
 
 def test_health_reports_ready_and_degraded_truthfully(tmp_path, monkeypatch):
     settings = _ready_layout(tmp_path)
-    monkeypatch.setattr(service, "check_cuda", lambda *args, **kwargs: {"available": True, "device": "GPU"})
+    monkeypatch.setattr(
+        service,
+        "check_cuda",
+        lambda *args, **kwargs: {"available": True, "device": "GPU"},
+    )
 
     ready = build_runtime_health(settings)
     assert ready["status"] == "ONLINE" and ready["ready"] is True
@@ -422,6 +646,135 @@ def test_health_reports_ready_and_degraded_truthfully(tmp_path, monkeypatch):
     degraded = build_runtime_health(settings)
     assert degraded["status"] == "DEGRADED" and degraded["ready"] is False
     assert degraded["checks"]["model"] is False
+
+
+@pytest.mark.parametrize("relative_path", REQUIRED_MODEL_PATHS)
+def test_health_requires_every_official_model(tmp_path, monkeypatch, relative_path):
+    settings = _ready_layout(tmp_path)
+    monkeypatch.setattr(service, "check_cuda", lambda *args, **kwargs: {"available": True, "device": "GPU"})
+    missing = settings.repo_path / relative_path
+    missing.unlink()
+
+    health = build_runtime_health(settings)
+
+    assert health["status"] == "DEGRADED"
+    assert health["ready"] is False
+    assert health["checks"]["model"] is False
+    assert relative_path in health["missing_models"]
+
+
+def test_health_endpoint_serializes_runtime_health(monkeypatch):
+    expected = {
+        "status": "ONLINE",
+        "ready": True,
+        "busy": False,
+        "active_child": False,
+        "persistent_model": False,
+        "checks": {"repo": True, "cuda": True},
+    }
+    monkeypatch.setattr(service, "build_runtime_health", lambda: expected)
+
+    with TestClient(service.app) as client:
+        response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == expected
+
+
+def test_generate_endpoint_returns_422_for_strict_validation(tmp_path, monkeypatch):
+    monkeypatch.setattr(service, "generation_lock", asyncio.Lock())
+    payload = _request(tmp_path).model_dump()
+    payload["target_duration"] = "0.4"
+
+    with TestClient(service.app) as client:
+        response = client.post("/generate", json=payload)
+
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "target_duration"]
+
+
+def test_generate_endpoint_maps_runtime_failure_to_500(tmp_path, monkeypatch):
+    request = _request(tmp_path)
+    monkeypatch.setattr(service, "generation_lock", asyncio.Lock())
+    monkeypatch.setattr(
+        service,
+        "run_generation",
+        lambda request: (_ for _ in ()).throw(RuntimeError("official CLI failed")),
+    )
+
+    with TestClient(service.app) as client:
+        response = client.post("/generate", json=request.model_dump())
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "MuseTalk generation failed: official CLI failed"}
+
+
+def test_generate_endpoint_success_runs_real_normalize_and_canonical_mux(tmp_path, monkeypatch):
+    request = _request(
+        tmp_path,
+        video_path=str(_video(tmp_path / "endpoint-source.mp4").resolve()),
+        audio_path=str(_audio(tmp_path / "endpoint-source.wav").resolve()),
+        metadata={
+            "project_id": "endpoint-project",
+            "shot_id": "endpoint-shot",
+            "input_assets": ["video", "audio"],
+        },
+    )
+    settings = _settings(tmp_path)
+
+    def fake_cli(command, **kwargs):
+        task_path = Path(command[command.index("--inference_config") + 1])
+        task = yaml.safe_load(task_path.read_text(encoding="utf-8"))["task_0"]
+        upstream = expected_musetalk_output(Path(command[command.index("--result_dir") + 1]))
+        upstream.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(task["video_path"], upstream)
+
+    monkeypatch.setattr(service, "generation_lock", asyncio.Lock())
+    monkeypatch.setattr(service, "get_settings", lambda: settings)
+    monkeypatch.setattr(service, "run_musetalk_command", fake_cli)
+
+    with TestClient(service.app) as client:
+        response = client.post("/generate", json=request.model_dump())
+
+    assert response.status_code == 200
+    payload = response.json()
+    output = Path(payload["output_path"])
+    manifest = Path(payload["manifest_path"])
+    assert output.is_file() and output.stat().st_size > 0
+    assert manifest.is_file() and manifest.stat().st_size > 0
+    assert service.probe_av(output).audio.codec == "aac"
+    assert json.loads(manifest.read_text(encoding="utf-8"))["metadata"] == request.metadata
+
+
+@pytest.mark.asyncio
+async def test_generate_endpoint_serializes_concurrent_requests(tmp_path, monkeypatch):
+    request = _request(tmp_path)
+    state_lock = threading.Lock()
+    state = {"active": 0, "maximum": 0, "calls": 0}
+
+    def fake_generation(request):
+        with state_lock:
+            state["active"] += 1
+            state["calls"] += 1
+            state["maximum"] = max(state["maximum"], state["active"])
+            call = state["calls"]
+        time.sleep(0.05)
+        with state_lock:
+            state["active"] -= 1
+        return {"output_path": f"output-{call}.mp4", "manifest_path": f"manifest-{call}.json"}
+
+    monkeypatch.setattr(service, "generation_lock", asyncio.Lock())
+    monkeypatch.setattr(service, "run_generation", fake_generation)
+    transport = httpx.ASGITransport(app=service.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first, second = await asyncio.gather(
+            client.post("/generate", json=request.model_dump()),
+            client.post("/generate", json=request.model_dump()),
+        )
+
+    assert first.status_code == second.status_code == 200
+    assert state == {"active": 0, "maximum": 1, "calls": 2}
+    assert first.json()["output_path"] != second.json()["output_path"]
 
 
 def test_unload_is_truthful_when_idle_or_active(monkeypatch):

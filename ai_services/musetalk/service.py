@@ -16,6 +16,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass
@@ -25,7 +26,15 @@ from typing import Any, Callable, Sequence
 
 import yaml
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, StrictBool, StrictInt
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictFloat,
+    StrictInt,
+    field_validator,
+)
 
 from app.services.media_probe import AVInfo, probe_av
 
@@ -35,6 +44,19 @@ DEFAULT_PYTHON = Path("E:/LocalDramaAI/env-musetalk/Scripts/python.exe")
 DEFAULT_FFMPEG_BIN = Path("E:/LocalDramaAI/ffmpeg/bin")
 DEFAULT_TIMEOUT_SECONDS = 1800.0
 MAX_LOG_CHARS = 1_000_000
+REQUIRED_MODEL_PATHS = (
+    "models/musetalkV15/unet.pth",
+    "models/musetalkV15/musetalk.json",
+    "models/sd-vae/config.json",
+    "models/sd-vae/diffusion_pytorch_model.bin",
+    "models/whisper/config.json",
+    "models/whisper/pytorch_model.bin",
+    "models/whisper/preprocessor_config.json",
+    "models/dwpose/dw-ll_ucoco_384.pth",
+    "models/syncnet/latentsync_syncnet.pt",
+    "models/face-parse-bisent/79999_iter.pth",
+    "models/face-parse-bisent/resnet18-5c106cde.pth",
+)
 
 
 @dataclass(frozen=True)
@@ -65,10 +87,44 @@ class GenerateRequest(BaseModel):
     video_path: str
     audio_path: str
     output_dir: str
-    target_duration: FiniteFloat
+    target_duration: StrictFloat = Field(gt=0, allow_inf_nan=False)
     batch_size: StrictInt = 4
     use_float16: StrictBool = True
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any]
+
+    @field_validator("target_duration", mode="before")
+    @classmethod
+    def _require_float_duration(cls, value: Any) -> Any:
+        if type(value) is not float:
+            raise ValueError("target_duration must be a float")
+        return value
+
+    @field_validator("metadata")
+    @classmethod
+    def _validate_binding_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        required_keys = ("project_id", "shot_id", "input_assets")
+        if set(value) != set(required_keys):
+            raise ValueError("metadata must contain only project_id, shot_id, and input_assets")
+        for key in ("project_id", "shot_id"):
+            if not isinstance(value[key], str) or not value[key].strip():
+                raise ValueError(f"metadata {key} must be a nonempty string")
+        input_assets = value["input_assets"]
+        if (
+            not isinstance(input_assets, list)
+            or len(input_assets) != 2
+            or any(
+                not isinstance(asset, str) or not asset.strip()
+                for asset in input_assets
+            )
+        ):
+            raise ValueError(
+                "metadata input_assets must contain source-video and dialogue-audio IDs in order"
+            )
+        return {
+            "project_id": value["project_id"],
+            "shot_id": value["shot_id"],
+            "input_assets": list(input_assets),
+        }
 
 
 @dataclass(frozen=True)
@@ -157,6 +213,8 @@ def build_musetalk_command(
     settings: MuseTalkSettings,
     inference_config: Path,
     result_dir: Path,
+    *,
+    ffmpeg_bin: Path | None = None,
 ) -> list[str]:
     return [
         str(settings.python_executable),
@@ -184,7 +242,7 @@ def build_musetalk_command(
         "--right_cheek_width",
         "90",
         "--ffmpeg_path",
-        str(settings.ffmpeg_bin),
+        str(ffmpeg_bin or settings.ffmpeg_bin),
     ]
 
 
@@ -196,6 +254,52 @@ def _write_bounded_log(log_path: Path, output: str | None) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     bounded = (output or "")[-MAX_LOG_CHARS:]
     log_path.write_text(bounded, encoding="utf-8", errors="replace")
+
+
+class _TailBuffer:
+    """Thread-safe fixed-size character tail for a streaming child log."""
+
+    def __init__(self, limit: int = MAX_LOG_CHARS) -> None:
+        self._limit = limit
+        self._value = ""
+        self._lock = threading.Lock()
+
+    def append(self, chunk: str) -> None:
+        if not chunk:
+            return
+        with self._lock:
+            self._value = (self._value + chunk)[-self._limit :]
+
+    def value(self) -> str:
+        with self._lock:
+            return self._value
+
+
+def _drain_child_output(stream: Any, tail: _TailBuffer) -> None:
+    try:
+        while True:
+            chunk = stream.read(8192)
+            if not chunk:
+                return
+            tail.append(chunk)
+    except Exception as exc:
+        tail.append(f"\n[MuseTalk log reader failed: {exc}]\n")
+
+
+def _stop_child(child: Any) -> None:
+    try:
+        running = child.poll() is None
+    except Exception:
+        running = True
+    if running:
+        try:
+            child.kill()
+        except Exception:
+            pass
+    try:
+        child.wait(timeout=5)
+    except Exception:
+        pass
 
 
 def run_musetalk_command(
@@ -210,7 +314,9 @@ def run_musetalk_command(
     if not isinstance(command, list) or not command:
         raise ValueError("MuseTalk command must be a nonempty argument list")
     child = None
-    output = ""
+    reader: threading.Thread | None = None
+    tail = _TailBuffer()
+    finished = False
     try:
         try:
             child = _spawn_child(
@@ -219,25 +325,44 @@ def run_musetalk_command(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 shell=False,
             )
         except OSError as exc:
             raise RuntimeError(f"MuseTalk child could not start: {exc}") from exc
         active_child = child
+        if child.stdout is None:
+            raise RuntimeError("MuseTalk child stdout pipe was not created")
+        reader = threading.Thread(
+            target=_drain_child_output,
+            args=(child.stdout, tail),
+            name="musetalk-log-reader",
+            daemon=True,
+        )
+        reader.start()
         try:
-            output, _ = child.communicate(timeout=timeout)
+            child.wait(timeout=timeout)
+            finished = True
         except subprocess.TimeoutExpired as exc:
-            child.kill()
-            try:
-                output, _ = child.communicate(timeout=5)
-            except Exception:
-                output = output or ""
-            _write_bounded_log(log_path, output)
+            _stop_child(child)
+            finished = True
             raise RuntimeError(f"MuseTalk child timed out after {timeout:g} seconds") from exc
-        _write_bounded_log(log_path, output)
         if child.returncode != 0:
             raise RuntimeError(f"MuseTalk child exited with status {child.returncode}")
     finally:
+        if child is not None and not finished:
+            _stop_child(child)
+        if reader is not None:
+            reader.join(timeout=5)
+            if reader.is_alive() and child is not None and child.stdout is not None:
+                try:
+                    child.stdout.close()
+                except Exception:
+                    pass
+                reader.join(timeout=1)
+        if child is not None:
+            _write_bounded_log(log_path, tail.value())
         active_child = None
 
 
@@ -595,24 +720,28 @@ def run_generation(
     settings = settings or get_settings()
     runner = command_runner or run_musetalk_command
     output_dir = Path(request.output_dir)
+    source_video = Path(request.video_path).resolve()
+    source_audio = Path(request.audio_path).resolve()
+    source_video_sha256 = _sha256(source_video)
+    source_audio_sha256 = _sha256(source_audio)
     job_dir = create_job_directory(output_dir)
-    ffmpeg = _resolve_tool(settings.ffmpeg_bin, "ffmpeg")
-    ffprobe = _resolve_tool(settings.ffmpeg_bin, "ffprobe")
     published: Path | None = None
     manifest_path: Path | None = None
     started = time.perf_counter()
     try:
+        ffmpeg = _resolve_tool(settings.ffmpeg_bin, "ffmpeg")
+        ffprobe = _resolve_tool(settings.ffmpeg_bin, "ffprobe")
         if ffmpeg is None or ffprobe is None:
             raise RuntimeError("FFmpeg and ffprobe are required for MuseTalk generation")
         normalized_video = normalize_video(
-            Path(request.video_path),
+            source_video,
             job_dir / "video.mp4",
             float(request.target_duration),
             ffmpeg_executable=ffmpeg,
             ffprobe_executable=ffprobe,
         )
         normalized_audio = normalize_audio(
-            Path(request.audio_path),
+            source_audio,
             job_dir / "audio.wav",
             float(request.target_duration),
             ffmpeg_executable=ffmpeg,
@@ -621,8 +750,14 @@ def run_generation(
         video_probe = probe_video(normalized_video, ffprobe)
         audio_probe = probe_audio(normalized_audio, ffprobe)
         task_path = write_inference_config(job_dir, normalized_video, normalized_audio)
+        inference_config = yaml.safe_load(task_path.read_text(encoding="utf-8"))
         result_dir = job_dir / "results"
-        command = build_musetalk_command(settings, task_path, result_dir)
+        command = build_musetalk_command(
+            settings,
+            task_path,
+            result_dir,
+            ffmpeg_bin=Path(ffmpeg).parent,
+        )
         log_path = job_dir / "musetalk.log"
         runner(
             command,
@@ -661,6 +796,16 @@ def run_generation(
             "use_float16": request.use_float16,
             "output_path": str(published),
             "sha256": sha256,
+            "output_sha256": sha256,
+            "source_video": {
+                "path": str(source_video),
+                "sha256": source_video_sha256,
+            },
+            "source_audio": {
+                "path": str(source_audio),
+                "sha256": source_audio_sha256,
+            },
+            "inference_config": inference_config,
             "metadata": request.metadata,
             "probes": {
                 "normalized_video": asdict(video_probe),
@@ -731,16 +876,19 @@ def check_cuda(settings: MuseTalkSettings, timeout: float = 20.0) -> dict[str, A
 def build_runtime_health(settings: MuseTalkSettings | None = None) -> dict[str, Any]:
     settings = settings or get_settings()
     inference = settings.repo_path / "scripts" / "inference.py"
-    model = settings.repo_path / "models" / "musetalkV15" / "unet.pth"
-    config = settings.repo_path / "models" / "musetalkV15" / "musetalk.json"
+    model_checks = {
+        relative_path: _ready_file(settings.repo_path / relative_path)
+        for relative_path in REQUIRED_MODEL_PATHS
+    }
+    models_ready = all(model_checks.values())
     ffmpeg = _resolve_tool(settings.ffmpeg_bin, "ffmpeg")
     ffprobe = _resolve_tool(settings.ffmpeg_bin, "ffprobe")
     cuda = check_cuda(settings)
     checks = {
         "repo": settings.repo_path.is_dir() and _ready_file(inference),
         "python": _ready_file(settings.python_executable),
-        "model": _ready_file(model),
-        "config": _ready_file(config),
+        "model": models_ready,
+        "config": model_checks["models/musetalkV15/musetalk.json"],
         "ffmpeg": ffmpeg is not None,
         "ffprobe": ffprobe is not None,
         "cuda": cuda.get("available") is True,
@@ -755,6 +903,8 @@ def build_runtime_health(settings: MuseTalkSettings | None = None) -> dict[str, 
         "persistent_model": False,
         "repo_commit": settings.repo_commit,
         "checks": checks,
+        "models": model_checks,
+        "missing_models": [path for path, present in model_checks.items() if not present],
         "cuda": cuda,
     }
 
