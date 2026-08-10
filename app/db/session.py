@@ -1,6 +1,7 @@
 from contextlib import contextmanager
 from pathlib import Path
 from sqlalchemy import create_engine, event
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker
 from app.models.base import Base
 
@@ -18,9 +19,9 @@ def get_engine(database_url: str):
             @event.listens_for(engine, "connect")
             def set_sqlite_pragmas(dbapi_connection, _):
                 cursor = dbapi_connection.cursor()
+                cursor.execute("PRAGMA busy_timeout=5000")
                 cursor.execute("PRAGMA journal_mode=WAL")
                 cursor.execute("PRAGMA foreign_keys=ON")
-                cursor.execute("PRAGMA busy_timeout=5000")
                 cursor.close()
         _engines[database_url] = engine
     return _engines[database_url]
@@ -30,10 +31,26 @@ def create_schema(database_url: str):
     if database_url.startswith("sqlite:///"):
         Path(database_url.removeprefix("sqlite:///" )).parent.mkdir(parents=True, exist_ok=True)
     from app import models  # noqa: F401
-    engine = get_engine(database_url)
-    Base.metadata.create_all(engine)
-    if engine.dialect.name == "sqlite":
-        with engine.begin() as connection:
+    if not database_url.startswith("sqlite"):
+        Base.metadata.create_all(get_engine(database_url))
+        return
+
+    is_memory_database = make_url(database_url).database in (None, "", ":memory:")
+    schema_engine = (
+        get_engine(database_url)
+        if is_memory_database
+        else create_engine(
+            database_url,
+            connect_args={"check_same_thread": False, "timeout": 5},
+            future=True,
+        )
+    )
+    try:
+        with schema_engine.connect() as connection:
+            connection.exec_driver_sql("PRAGMA busy_timeout=5000")
+            connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+            connection.exec_driver_sql("BEGIN EXCLUSIVE")
+            Base.metadata.create_all(connection)
             columns = {
                 row[1]
                 for row in connection.exec_driver_sql("PRAGMA table_info(generation_jobs)")
@@ -42,6 +59,10 @@ def create_schema(database_url: str):
                 connection.exec_driver_sql(
                     "ALTER TABLE generation_jobs ADD COLUMN cancel_requested_at DATETIME"
                 )
+            connection.commit()
+    finally:
+        if not is_memory_database:
+            schema_engine.dispose()
 
 @contextmanager
 def session_scope(database_url: str):

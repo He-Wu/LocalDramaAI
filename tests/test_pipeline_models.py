@@ -1,4 +1,7 @@
 import sqlite3
+import subprocess
+import sys
+import time
 from datetime import datetime
 
 import pytest
@@ -10,8 +13,7 @@ from app.db.session import create_schema, session_scope
 from app.models import GenerationJob, JobStage, Project
 
 
-def test_create_schema_upgrades_existing_generation_jobs_table(tmp_path):
-    database = tmp_path / "legacy.db"
+def _create_legacy_database(database):
     with sqlite3.connect(database) as connection:
         connection.executescript(
             """
@@ -43,6 +45,11 @@ def test_create_schema_upgrades_existing_generation_jobs_table(tmp_path):
             """
         )
 
+
+def test_create_schema_upgrades_existing_generation_jobs_table(tmp_path):
+    database = tmp_path / "legacy.db"
+    _create_legacy_database(database)
+
     create_schema(str(database))
     create_schema(str(database))
 
@@ -53,6 +60,77 @@ def test_create_schema_upgrades_existing_generation_jobs_table(tmp_path):
     with session_scope(str(database)) as session:
         job = session.get(GenerationJob, "legacy-job")
         assert job.cancel_requested_at is None
+
+
+def test_create_schema_keeps_in_memory_sqlite_schema_alive():
+    database = "sqlite:///:memory:"
+    create_schema(database)
+
+    with session_scope(database) as session:
+        project = Project(name="In memory")
+        session.add(project)
+        session.flush()
+        assert project.id is not None
+
+
+def test_concurrent_create_schema_serializes_sqlite_upgrade(tmp_path):
+    database = tmp_path / "concurrent-legacy.db"
+    _create_legacy_database(database)
+    go = tmp_path / "go"
+    ready_files = [tmp_path / "ready-1", tmp_path / "ready-2"]
+    script = """
+import sys
+import time
+from pathlib import Path
+
+from app.db.session import create_schema
+
+database, ready_path, go_path = sys.argv[1:]
+Path(ready_path).touch()
+deadline = time.monotonic() + 10
+while not Path(go_path).exists():
+    if time.monotonic() >= deadline:
+        raise TimeoutError("parent did not release schema creation barrier")
+    time.sleep(0.001)
+create_schema(database)
+"""
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", script, str(database), str(ready), str(go)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for ready in ready_files
+    ]
+    deadline = time.monotonic() + 10
+    while not all(ready.exists() for ready in ready_files):
+        if time.monotonic() >= deadline:
+            for process in processes:
+                process.kill()
+            pytest.fail("schema creation subprocesses did not reach the barrier")
+        time.sleep(0.001)
+    go.touch()
+
+    results = [process.communicate(timeout=15) for process in processes]
+    for process, (stdout, stderr) in zip(processes, results):
+        assert process.returncode == 0, f"stdout:\n{stdout}\nstderr:\n{stderr}"
+
+    with sqlite3.connect(database) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(generation_jobs)")}
+        legacy_row = connection.execute(
+            "SELECT id, status FROM generation_jobs WHERE id = 'legacy-job'"
+        ).fetchone()
+    assert "job_stages" in tables
+    assert "cancel_requested_at" in columns
+    assert legacy_row == ("legacy-job", "QUEUED")
+
+    with session_scope(str(database)) as session:
+        assert session.get(GenerationJob, "legacy-job").status == JobStatus.QUEUED
 
 
 def test_full_drama_stage_order_is_stable():
