@@ -61,6 +61,7 @@ def test_setup_is_pinned_and_isolated():
     assert "Get-FileHash" in setup
     assert "Get-AuthenticodeSignature" in setup
     assert "$LASTEXITCODE" in setup
+    assert "pip', 'check" in setup
 
 
 def test_model_downloads_use_official_pinned_repositories_and_hash_every_file():
@@ -100,6 +101,7 @@ def test_musetalk_lifecycle_is_loopback_hidden_and_stops_children():
     stop = _text("stop_all.ps1")
     assert "127.0.0.1" in start and "8030" in start
     assert "ai_services.musetalk.service:app" in start
+    assert "LOCALDRAMA_MUSETALK_REPO" in start
     assert "-WindowStyle" in start and "Hidden" in start
     assert "start_musetalk.ps1" in aggregate
     assert "ai_services.musetalk.service:app" in stop

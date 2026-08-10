@@ -39,7 +39,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "Could not resolve MuseTalk repository commit"
 }
 
-$env:LOCALDRAMA_MUSETALK_REPOSITORY = $repository
+$env:LOCALDRAMA_MUSETALK_REPO = $repository
 $env:LOCALDRAMA_MUSETALK_PYTHON = $python
 $env:LOCALDRAMA_MUSETALK_FFMPEG_BIN = $ffmpegBin
 $env:LOCALDRAMA_MUSETALK_REPO_COMMIT = $resolvedCommit
