@@ -89,11 +89,31 @@ def test_model_downloads_use_official_pinned_repositories_and_hash_every_file():
         "resnet18-5c106cde.pth",
     ):
         assert filename in download
+    for official_lfs_sha256 in (
+        "5b6923aee04d71692e0e9846c471e0a4ea07a4f686d39545e472bd4ba17e1b47",
+        "7ebf6c98c181e20838e4c0054e96e944ac60d5d692cc01db42839fe11b787007",
+        "92d3dfb746fca211a2c9e019e285f8597412211728dce3c5bcf4eda0f2d62e7e",
+        "1b4889b6b1d4ce7ae320a02dedaeff1780ad77d415ea0d744b476155c6377ddc",
+        "ffdccec4f3211f4c63310f2b7098f309fe70f3952cedc5e4d11e43f5b2379b98",
+        "9607f98a2b22d9e229ae43c52ecea79dcede9e0c5cfae67e8da6eda86d8aac1d",
+        "9b5cd03a36fbb8a627c64d98a5b5b126ead95a77720723944487311f0110b666",
+        "0d9408b13cd863c4e95a149dd31232f88f2a12aa6cf8964ed74d7d97748c7a07",
+        "38fa63bad3ed2332f647c40a5dc616cb0e233db8579f698f62af4c41965c4da5",
+        "468e13ca13a9b43cc0881a9f99083a430e9c0a38abd935431d1c28ee94b26567",
+        "5c106cde386e87d4033832f2996f5493238eda96ccf559d1d62760c4de0613f8",
+    ):
+        assert official_lfs_sha256 in download
+    assert "3400074924" in download
+    assert "ExpectedBytes" in download
+    assert "ExpectedSha256" in download
     assert "Get-FileHash" in download
     assert "model-hashes.json" in download
     assert "curl.exe" in download
     assert "--location" in download
     assert "--continue-at" in download
+    assert "for ($attempt = 1; $attempt -le" in download
+    assert "Start-Sleep" in download
+    assert "--retry-all-errors" not in download
     assert ".download" in download
     assert "Move-Item" in download
     assert "/resolve/" in download

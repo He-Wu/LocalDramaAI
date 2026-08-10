@@ -23,6 +23,11 @@ $downloads = @(
         LocalDirectory = $models
         Include = @('musetalkV15/musetalk.json', 'musetalkV15/unet.pth')
         Expected = @('musetalkV15\musetalk.json', 'musetalkV15\unet.pth')
+        ExpectedBytes = @([long]748, [long]3400074924)
+        ExpectedSha256 = @(
+            '5b6923aee04d71692e0e9846c471e0a4ea07a4f686d39545e472bd4ba17e1b47',
+            '7ebf6c98c181e20838e4c0054e96e944ac60d5d692cc01db42839fe11b787007'
+        )
     },
     [pscustomobject]@{
         Repository = 'stabilityai/sd-vae-ft-mse'
@@ -30,6 +35,11 @@ $downloads = @(
         LocalDirectory = (Join-Path $models 'sd-vae')
         Include = @('config.json', 'diffusion_pytorch_model.bin')
         Expected = @('sd-vae\config.json', 'sd-vae\diffusion_pytorch_model.bin')
+        ExpectedBytes = @([long]547, [long]334707217)
+        ExpectedSha256 = @(
+            '92d3dfb746fca211a2c9e019e285f8597412211728dce3c5bcf4eda0f2d62e7e',
+            '1b4889b6b1d4ce7ae320a02dedaeff1780ad77d415ea0d744b476155c6377ddc'
+        )
     },
     [pscustomobject]@{
         Repository = 'openai/whisper-tiny'
@@ -37,6 +47,12 @@ $downloads = @(
         LocalDirectory = (Join-Path $models 'whisper')
         Include = @('config.json', 'pytorch_model.bin', 'preprocessor_config.json')
         Expected = @('whisper\config.json', 'whisper\pytorch_model.bin', 'whisper\preprocessor_config.json')
+        ExpectedBytes = @([long]1983, [long]151095027, [long]184990)
+        ExpectedSha256 = @(
+            'ffdccec4f3211f4c63310f2b7098f309fe70f3952cedc5e4d11e43f5b2379b98',
+            '9607f98a2b22d9e229ae43c52ecea79dcede9e0c5cfae67e8da6eda86d8aac1d',
+            '9b5cd03a36fbb8a627c64d98a5b5b126ead95a77720723944487311f0110b666'
+        )
     },
     [pscustomobject]@{
         Repository = 'yzd-v/DWPose'
@@ -44,6 +60,8 @@ $downloads = @(
         LocalDirectory = (Join-Path $models 'dwpose')
         Include = @('dw-ll_ucoco_384.pth')
         Expected = @('dwpose\dw-ll_ucoco_384.pth')
+        ExpectedBytes = @([long]406878486)
+        ExpectedSha256 = @('0d9408b13cd863c4e95a149dd31232f88f2a12aa6cf8964ed74d7d97748c7a07')
     },
     [pscustomobject]@{
         Repository = 'ByteDance/LatentSync'
@@ -51,6 +69,8 @@ $downloads = @(
         LocalDirectory = (Join-Path $models 'syncnet')
         Include = @('latentsync_syncnet.pt')
         Expected = @('syncnet\latentsync_syncnet.pt')
+        ExpectedBytes = @([long]1488019828)
+        ExpectedSha256 = @('38fa63bad3ed2332f647c40a5dc616cb0e233db8579f698f62af4c41965c4da5')
     },
     [pscustomobject]@{
         Repository = 'ManyOtherFunctions/face-parse-bisent'
@@ -58,12 +78,18 @@ $downloads = @(
         LocalDirectory = (Join-Path $models 'face-parse-bisent')
         Include = @('79999_iter.pth', 'resnet18-5c106cde.pth')
         Expected = @('face-parse-bisent\79999_iter.pth', 'face-parse-bisent\resnet18-5c106cde.pth')
+        ExpectedBytes = @([long]53289463, [long]46827520)
+        ExpectedSha256 = @(
+            '468e13ca13a9b43cc0881a9f99083a430e9c0a38abd935431d1c28ee94b26567',
+            '5c106cde386e87d4033832f2996f5493238eda96ccf559d1d62760c4de0613f8'
+        )
     }
 )
 
 New-Item -ItemType Directory -Path $models -Force | Out-Null
 $manifest = Join-Path $models 'model-hashes.json'
 $verifiedRecords = @{}
+$calculatedHashes = @{}
 if (Test-Path -LiteralPath $manifest -PathType Leaf) {
     try {
         foreach ($record in @(Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json)) {
@@ -79,6 +105,8 @@ foreach ($download in $downloads) {
     for ($index = 0; $index -lt $download.Include.Count; $index++) {
         $sourcePath = $download.Include[$index]
         $relativePath = $download.Expected[$index]
+        $expectedBytes = [long]$download.ExpectedBytes[$index]
+        $expectedSha256 = [string]$download.ExpectedSha256[$index]
         $destination = Join-Path $models $relativePath
         $manifestPath = [System.IO.Path]::GetRelativePath($repository, $destination).Replace('\', '/')
         $record = $verifiedRecords[$manifestPath]
@@ -88,9 +116,13 @@ foreach ($download in $downloads) {
             $record.revision -eq $download.Revision -and
             (Test-Path -LiteralPath $destination -PathType Leaf)) {
             $file = Get-Item -LiteralPath $destination
-            if ($file.Length -eq [long]$record.bytes) {
+            if ($file.Length -eq $expectedBytes -and $file.Length -eq [long]$record.bytes) {
                 $hash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
-                $cached = $hash -eq [string]$record.sha256
+                $cached = $hash -eq [string]$record.sha256 -and
+                    (-not $expectedSha256 -or $hash -eq $expectedSha256)
+                if ($cached) {
+                    $calculatedHashes[$manifestPath] = $hash
+                }
             }
         }
         if ($cached) {
@@ -108,36 +140,71 @@ foreach ($download in $downloads) {
             '--fail',
             '--location',
             '--show-error',
-            '--retry', '5',
-            '--retry-delay', '2',
-            '--retry-all-errors',
             '--connect-timeout', '30',
+            '--speed-limit', '1024',
+            '--speed-time', '60',
             '--continue-at', '-',
             '--output', $partial,
             $url
         )
-        & $curl @arguments
-        if ($LASTEXITCODE -ne 0) {
+        $curlExitCode = 1
+        $rangeResetAttempted = $false
+        for ($attempt = 1; $attempt -le 6; $attempt++) {
+            & $curl @arguments
+            $curlExitCode = $LASTEXITCODE
+            if ($curlExitCode -eq 0) {
+                break
+            }
+            if ($curlExitCode -eq 33 -and -not $rangeResetAttempted -and
+                (Test-Path -LiteralPath $partial -PathType Leaf) -and
+                (Get-Item -LiteralPath $partial).Length -gt 0) {
+                Write-Warning "The remote server rejected the partial range; restarting this file once"
+                Remove-Item -LiteralPath $partial -Force
+                $rangeResetAttempted = $true
+            }
+            if ($attempt -lt 6) {
+                $partialBytes = if (Test-Path -LiteralPath $partial -PathType Leaf) {
+                    (Get-Item -LiteralPath $partial).Length
+                }
+                else {
+                    0
+                }
+                Write-Warning "Download attempt $attempt failed with curl exit $curlExitCode; retaining $partialBytes bytes and retrying"
+                Start-Sleep -Seconds ([Math]::Min(30, [Math]::Pow(2, $attempt)))
+            }
+        }
+        if ($curlExitCode -ne 0) {
             throw "Official model download failed for $($download.Repository)/$sourcePath at $($download.Revision); partial file retained at $partial"
         }
-        if (-not (Test-Path -LiteralPath $partial -PathType Leaf) -or
-            (Get-Item -LiteralPath $partial).Length -le 0) {
-            throw "Official model download produced an empty file: $partial"
+        if (-not (Test-Path -LiteralPath $partial -PathType Leaf)) {
+            throw "Official model download did not produce a file: $partial"
+        }
+        $partialFile = Get-Item -LiteralPath $partial
+        if ($partialFile.Length -ne $expectedBytes) {
+            throw "Official model size mismatch for $sourcePath`: expected $expectedBytes bytes, got $($partialFile.Length); partial file retained at $partial"
+        }
+        $downloadedHash = (Get-FileHash -LiteralPath $partial -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($expectedSha256 -and $downloadedHash -ne $expectedSha256) {
+            throw "Official LFS SHA256 mismatch for $sourcePath`: expected $expectedSha256, got $downloadedHash; partial file retained at $partial"
         }
         Move-Item -LiteralPath $partial -Destination $destination -Force
+        $calculatedHashes[$manifestPath] = $downloadedHash
     }
 }
 
 $hashRecords = @()
 foreach ($download in $downloads) {
-    foreach ($relativePath in $download.Expected) {
+    for ($index = 0; $index -lt $download.Expected.Count; $index++) {
+        $relativePath = $download.Expected[$index]
+        $expectedBytes = [long]$download.ExpectedBytes[$index]
+        $expectedSha256 = [string]$download.ExpectedSha256[$index]
         $path = Join-Path $models $relativePath
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
             throw "Expected MuseTalk model file is missing: $path"
         }
         $file = Get-Item -LiteralPath $path
-        if ($file.Length -le 0) {
-            throw "MuseTalk model file is empty: $path"
+        if ($file.Length -ne $expectedBytes) {
+            throw "MuseTalk model size mismatch for $path`: expected $expectedBytes bytes, got $($file.Length)"
         }
         $prefixBuffer = New-Object byte[] 128
         $stream = [System.IO.File]::OpenRead($path)
@@ -151,14 +218,21 @@ foreach ($download in $downloads) {
         if ($prefixText.StartsWith('version https://git-lfs.github.com/spec/')) {
             throw "MuseTalk model file is an unresolved Git LFS pointer: $path"
         }
-        $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+        $manifestPath = [System.IO.Path]::GetRelativePath($repository, $path).Replace('\', '/')
+        $hash = $calculatedHashes[$manifestPath]
+        if (-not $hash) {
+            $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
         if ($hash.Length -ne 64) {
             throw "Could not calculate SHA256 for MuseTalk model file: $path"
+        }
+        if ($expectedSha256 -and $hash -ne $expectedSha256) {
+            throw "MuseTalk official LFS SHA256 mismatch for $path"
         }
         $hashRecords += [pscustomobject]@{
             repository = $download.Repository
             revision = $download.Revision
-            path = [System.IO.Path]::GetRelativePath($repository, $path).Replace('\', '/')
+            path = $manifestPath
             bytes = $file.Length
             sha256 = $hash
         }
