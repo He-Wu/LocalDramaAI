@@ -1,11 +1,31 @@
 import sqlite3
+import subprocess
+import sys
+import time
 import warnings
+from pathlib import Path
 
 from sqlalchemy import create_engine, inspect, text
 
 from app.db.session import create_schema, session_scope
 from app.models import Project, Scene, Shot
 from app.schemas.drama import ShotSpec
+
+
+INITIALIZE_DATABASE_WORKER = """
+import sys
+import time
+from pathlib import Path
+
+from app.db.session import initialize_database
+
+database, gate_path, ready_path = sys.argv[1:]
+gate = Path(gate_path)
+Path(ready_path).touch()
+while not gate.exists():
+    time.sleep(0.005)
+initialize_database(database)
+"""
 
 
 def _create_phase7_database(database):
@@ -80,14 +100,75 @@ def _assert_phase8_shot_schema(database):
                     """
                 )
             ).mappings().one()
+            revision = connection.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one()
         assert row == {
             "requires_lip_sync": 0,
             "speaker_visible": 0,
             "lipsync_asset_id": None,
             "video_asset_id": "video-asset-1",
         }
+        assert revision == "0001_phase8_shot_lipsync"
     finally:
         engine.dispose()
+
+
+def _run_concurrent_initializers(database, synchronization_dir, worker_count=4):
+    gate = synchronization_dir / "start"
+    ready_paths = [synchronization_dir / f"ready-{index}" for index in range(worker_count)]
+    repository_root = Path(__file__).resolve().parents[1]
+    processes = [
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                INITIALIZE_DATABASE_WORKER,
+                str(database),
+                str(gate),
+                str(ready_path),
+            ],
+            cwd=repository_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for ready_path in ready_paths
+    ]
+
+    outcomes = []
+    try:
+        ready_deadline = time.monotonic() + 10
+        while not all(path.exists() for path in ready_paths):
+            early_exits = [process.returncode for process in processes if process.poll() is not None]
+            if early_exits:
+                raise AssertionError(f"initializer exited before synchronization: {early_exits}")
+            if time.monotonic() >= ready_deadline:
+                raise AssertionError("initializers did not reach synchronization gate within 10 seconds")
+            time.sleep(0.01)
+
+        gate.touch()
+        for process in processes:
+            try:
+                stdout, stderr = process.communicate(timeout=20)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                stdout, stderr = process.communicate()
+                stderr = f"{stderr}\ninitializer exceeded 20 second timeout"
+            outcomes.append(
+                {
+                    "returncode": process.returncode,
+                    "stdout": stdout.strip(),
+                    "stderr": stderr.strip(),
+                }
+            )
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
+    return outcomes
 
 
 def test_phase8_shot_defaults_are_false(tmp_path):
@@ -142,6 +223,21 @@ def test_initialize_database_upgrades_phase7_database(tmp_path):
     initialize_database(f"sqlite:///{database.as_posix()}")
 
     _assert_phase8_shot_schema(database)
+
+
+def test_initialize_database_is_safe_across_processes(tmp_path):
+    for round_index in range(3):
+        round_dir = tmp_path / f"round-{round_index}"
+        round_dir.mkdir()
+        database = round_dir / "phase7.db"
+        _create_phase7_database(database)
+
+        outcomes = _run_concurrent_initializers(database, round_dir)
+
+        assert all(outcome["returncode"] == 0 for outcome in outcomes), (
+            f"concurrent initialization failed in round {round_index}: {outcomes}"
+        )
+        _assert_phase8_shot_schema(database)
 
 
 def test_api_and_worker_startups_initialize_database(monkeypatch):
