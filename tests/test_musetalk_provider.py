@@ -1,10 +1,13 @@
+import asyncio
 import json
+import time
 from pathlib import Path
 
 import httpx
 import pytest
 
 from app.core.config import Settings
+from app.providers import musetalk_provider as musetalk_provider_module
 from app.providers.musetalk_provider import MuseTalkProvider
 
 
@@ -18,6 +21,37 @@ def _source_files(tmp_path: Path) -> tuple[Path, Path]:
     video_path = _write_nonempty(tmp_path / "source video.mp4", b"video")
     audio_path = _write_nonempty(tmp_path / "source audio.wav", b"audio")
     return video_path, audio_path
+
+
+def _metadata(**overrides) -> dict:
+    metadata = {
+        "project_id": "project-1",
+        "shot_id": "shot-1",
+        "input_assets": ["video-asset", "audio-asset"],
+        "target_duration": 2.5,
+    }
+    metadata.update(overrides)
+    return metadata
+
+
+class CountingAsyncByteStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[bytes], *, delay: float = 0):
+        self.chunks = chunks
+        self.delay = delay
+        self.chunks_yielded = 0
+        self.bytes_yielded = 0
+        self.closed = False
+
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            if self.delay:
+                await asyncio.sleep(self.delay)
+            self.chunks_yielded += 1
+            self.bytes_yielded += len(chunk)
+            yield chunk
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 def test_settings_default_to_local_musetalk_service(monkeypatch: pytest.MonkeyPatch):
@@ -131,6 +165,75 @@ async def test_health_reports_bounded_sanitized_http_errors(status_code: int):
 
 
 @pytest.mark.anyio
+async def test_health_streams_only_a_bounded_error_body():
+    secret = b"actual-error-bearer-token"
+    stream = CountingAsyncByteStream(
+        [b"Authorization: Bearer " + secret + b"\nservice unavailable "]
+        + ([b"x" * 64] * 30)
+    )
+    provider = MuseTalkProvider(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(503, stream=stream)
+        )
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        await provider.health()
+
+    message = str(caught.value)
+    assert "HTTP 503" in message
+    assert secret.decode() not in message
+    assert stream.bytes_yielded <= 512
+    assert stream.chunks_yielded < len(stream.chunks)
+    assert stream.closed
+
+
+@pytest.mark.anyio
+async def test_health_rejects_an_oversized_streamed_success_object():
+    stream = CountingAsyncByteStream(
+        [b'{"payload":"'] + ([b"x" * 1024] * 70) + [b'"}']
+    )
+    provider = MuseTalkProvider(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, stream=stream)
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="JSON response exceeded 65536 bytes"):
+        await provider.health()
+
+    assert stream.bytes_yielded <= 66 * 1024
+    assert stream.chunks_yielded < len(stream.chunks)
+    assert stream.closed
+
+
+@pytest.mark.anyio
+async def test_health_fully_redacts_bearer_and_basic_authorization_credentials():
+    bearer_token = "eyJhbGciOiJIUzI1NiJ9.real-signature-segment"
+    basic_token = "dXNlcjpzdXBlci1zZWNyZXQtcGFzc3dvcmQ="
+    body = (
+        f"Authorization: Bearer {bearer_token}\n"
+        f"authorization=Basic {basic_token}\n"
+        "access denied"
+    )
+    provider = MuseTalkProvider(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(401, text=body)
+        )
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        await provider.health()
+
+    message = str(caught.value)
+    assert bearer_token not in message
+    assert basic_token not in message
+    assert "Bearer" not in message
+    assert "Basic" not in message
+    assert message.count("<redacted>") >= 2
+
+
+@pytest.mark.anyio
 async def test_health_bounds_and_sanitizes_an_empty_body_reason_phrase():
     secret = "do-not-leak-this-password"
     reason_phrase = (
@@ -156,6 +259,62 @@ async def test_health_bounds_and_sanitizes_an_empty_body_reason_phrase():
     assert secret not in message
     assert message.endswith("...")
     assert len(message) < 700
+
+
+@pytest.mark.anyio
+async def test_health_and_unload_use_short_phase_timeouts():
+    captured: dict[str, dict] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured[request.url.path] = request.extensions["timeout"]
+        return httpx.Response(200, json={"ok": True})
+
+    provider = MuseTalkProvider(
+        timeout=1800,
+        transport=httpx.MockTransport(handler),
+    )
+
+    await provider.health()
+    await provider.unload()
+
+    expected = {
+        "connect": 10.0,
+        "read": 10.0,
+        "write": 10.0,
+        "pool": 10.0,
+    }
+    assert captured == {"/health": expected, "/unload": expected}
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("method_name", ["health", "unload"])
+async def test_control_endpoints_enforce_a_short_wall_clock_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    method_name: str,
+):
+    monkeypatch.setattr(
+        musetalk_provider_module,
+        "_CONTROL_DEADLINE_SECONDS",
+        0.08,
+        raising=False,
+    )
+    stream = CountingAsyncByteStream(
+        [b'{"ok"', b":", b"true", b"}"],
+        delay=0.03,
+    )
+    provider = MuseTalkProvider(
+        timeout=1800,
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, stream=stream)
+        ),
+    )
+
+    started = time.perf_counter()
+    with pytest.raises(RuntimeError, match=rf"timed out for .* /{method_name}"):
+        await getattr(provider, method_name)()
+
+    assert time.perf_counter() - started < 0.25
+    assert stream.closed
 
 
 @pytest.mark.anyio
@@ -192,7 +351,13 @@ async def test_generate_posts_absolute_paths_and_fixed_service_options(tmp_path:
         video_path,
         audio_path,
         output_dir,
-        {"target_duration": 2.75, "project_id": "not-forwarded"},
+        _metadata(
+            target_duration=2.75,
+            project_id="project-42",
+            shot_id="shot-17",
+            input_assets=["video-9", "audio-4"],
+            ignored="not-forwarded",
+        ),
     )
 
     assert captured["method"] == "POST"
@@ -204,6 +369,11 @@ async def test_generate_posts_absolute_paths_and_fixed_service_options(tmp_path:
         "target_duration": 2.75,
         "batch_size": 4,
         "use_float16": True,
+        "metadata": {
+            "project_id": "project-42",
+            "shot_id": "shot-17",
+            "input_assets": ["video-9", "audio-4"],
+        },
     }
     assert all(Path(captured["payload"][key]).is_absolute() for key in (
         "video_path",
@@ -211,13 +381,50 @@ async def test_generate_posts_absolute_paths_and_fixed_service_options(tmp_path:
         "output_dir",
     ))
     assert captured["timeout"] == {
-        "connect": 17.5,
+        "connect": 10.0,
         "read": 17.5,
-        "write": 17.5,
-        "pool": 17.5,
+        "write": 10.0,
+        "pool": 10.0,
     }
     assert returned_output == output_path.resolve()
     assert returned_manifest == manifest_path.resolve()
+
+
+@pytest.mark.anyio
+async def test_generate_enforces_an_overall_wall_clock_deadline(tmp_path: Path):
+    video_path, audio_path = _source_files(tmp_path)
+    output_dir = tmp_path / "output"
+    output_path = _write_nonempty(output_dir / "result.mp4", b"video")
+    manifest_path = _write_nonempty(output_dir / "result.manifest.json", b"{}")
+    body = json.dumps(
+        {
+            "output_path": str(output_path),
+            "manifest_path": str(manifest_path),
+        }
+    ).encode()
+    chunk_size = max(1, len(body) // 4)
+    stream = CountingAsyncByteStream(
+        [body[index : index + chunk_size] for index in range(0, len(body), chunk_size)],
+        delay=0.03,
+    )
+    provider = MuseTalkProvider(
+        timeout=0.08,
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, stream=stream)
+        ),
+    )
+
+    started = time.perf_counter()
+    with pytest.raises(RuntimeError, match="timed out for POST /generate"):
+        await provider.generate(
+            video_path,
+            audio_path,
+            output_dir,
+            _metadata(),
+        )
+
+    assert time.perf_counter() - started < 0.25
+    assert stream.closed
 
 
 @pytest.mark.anyio
@@ -248,6 +455,47 @@ async def test_generate_requires_a_positive_finite_target_duration(
 
     with pytest.raises(ValueError, match="target_duration must be a positive number"):
         await provider.generate(video_path, audio_path, tmp_path / "output", metadata)
+
+    assert transport_calls == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"shot_id": "shot-1", "input_assets": ["video", "audio"], "target_duration": 2.5},
+        _metadata(project_id=""),
+        {"project_id": "project-1", "input_assets": ["video", "audio"], "target_duration": 2.5},
+        _metadata(shot_id=""),
+        {"project_id": "project-1", "shot_id": "shot-1", "target_duration": 2.5},
+        _metadata(input_assets=[]),
+        _metadata(input_assets=["video-only"]),
+        _metadata(input_assets=["video", "audio", "extra"]),
+        _metadata(input_assets=["video", ""]),
+        _metadata(input_assets=["video", 42]),
+    ],
+)
+async def test_generate_rejects_invalid_provenance_metadata_before_transport(
+    tmp_path: Path,
+    metadata: dict,
+):
+    video_path, audio_path = _source_files(tmp_path)
+    transport_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal transport_calls
+        transport_calls += 1
+        return httpx.Response(500)
+
+    provider = MuseTalkProvider(transport=httpx.MockTransport(handler))
+
+    with pytest.raises(ValueError, match="MuseTalk metadata"):
+        await provider.generate(
+            video_path,
+            audio_path,
+            tmp_path / "output",
+            metadata,
+        )
 
     assert transport_calls == 0
 
@@ -292,7 +540,7 @@ async def test_generate_rejects_missing_or_empty_sources_before_transport(
             video_path,
             audio_path,
             tmp_path / "output",
-            {"target_duration": 2.5},
+            _metadata(),
         )
 
     assert transport_calls == 0
@@ -325,7 +573,7 @@ async def test_generate_rejects_missing_response_paths(
             video_path,
             audio_path,
             tmp_path / "output",
-            {"target_duration": 2.5},
+            _metadata(),
         )
 
 
@@ -368,7 +616,7 @@ async def test_generate_rejects_invalid_returned_output(
             video_path,
             audio_path,
             output_dir,
-            {"target_duration": 2.5},
+            _metadata(),
         )
 
 
@@ -404,7 +652,57 @@ async def test_generate_rejects_invalid_returned_manifest(
             video_path,
             audio_path,
             output_dir,
-            {"target_duration": 2.5},
+            _metadata(),
+        )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("returned_key", ["output_path", "manifest_path"])
+@pytest.mark.parametrize("escape_style", ["absolute", "traversal", "root-relative"])
+async def test_generate_rejects_returned_paths_outside_output_dir(
+    tmp_path: Path,
+    returned_key: str,
+    escape_style: str,
+):
+    video_path, audio_path = _source_files(tmp_path)
+    output_dir = tmp_path / "requested" / "nested"
+    inside_output = _write_nonempty(output_dir / "inside.mp4", b"video")
+    inside_manifest = _write_nonempty(output_dir / "inside.manifest.json", b"{}")
+    outside_suffix = ".mp4" if returned_key == "output_path" else ".manifest.json"
+    outside_path = _write_nonempty(
+        tmp_path / f"outside-{returned_key}{outside_suffix}",
+        b"outside",
+    ).resolve()
+    if escape_style == "absolute":
+        escaped_value = str(outside_path)
+    elif escape_style == "traversal":
+        escaped_value = str(Path("..") / ".." / outside_path.name)
+    else:
+        if not outside_path.drive:
+            pytest.skip("Windows root-relative paths require a drive")
+        escaped_value = str(outside_path)[len(outside_path.drive) :]
+        assert escaped_value.startswith(("\\", "/"))
+
+    response_json = {
+        "output_path": str(inside_output),
+        "manifest_path": str(inside_manifest),
+    }
+    response_json[returned_key] = escaped_value
+    provider = MuseTalkProvider(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json=response_json)
+        )
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=rf"{returned_key} must be inside output_dir",
+    ):
+        await provider.generate(
+            video_path,
+            audio_path,
+            output_dir,
+            _metadata(),
         )
 
 
