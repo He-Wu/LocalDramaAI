@@ -100,11 +100,14 @@ def replace_project_drama(
             session.flush()
             shots[spec.order] = shot
 
-        for order, spec in enumerate(drama.dialogues, start=1):
+        dialogue_orders = {}
+        for spec in sorted(drama.dialogues, key=lambda item: item.shot_order):
             shot = shots.get(spec.shot_order)
             if shot is None:
                 raise ValueError(f"dialogue references missing shot {spec.shot_order}")
             character = characters.get(spec.character_name) if spec.character_name else None
+            order = dialogue_orders.get(spec.shot_order, 0) + 1
+            dialogue_orders[spec.shot_order] = order
             session.add(
                 Dialogue(
                     shot_id=shot.id,

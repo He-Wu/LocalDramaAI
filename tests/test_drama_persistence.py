@@ -55,6 +55,45 @@ def test_replace_project_drama_maps_scene_character_shot_and_dialogue(tmp_path):
         assert dialogue.shot_id == shot.id and dialogue.character_id == character.id
 
 
+def test_replace_project_drama_groups_dialogues_by_shot_with_stable_local_order(tmp_path):
+    database = str(tmp_path / "dialogue-order.db")
+    create_schema(database)
+    with session_scope(database) as session:
+        project = Project(name="对白排序")
+        session.add(project)
+        session.flush()
+        project_id = project.id
+
+    drama = StructuredDrama.model_validate({
+        "title": "对白排序",
+        "characters": [{"name": "林遥"}],
+        "scenes": [{"order": 1, "title": "雨夜", "description": "路灯下"}],
+        "shots": [
+            {"order": 1, "scene_order": 1, "title": "近景", "description": "抬头"},
+            {"order": 2, "scene_order": 1, "title": "远景", "description": "雨幕"},
+        ],
+        "dialogues": [
+            {"shot_order": 2, "text": "第二镜第一句"},
+            {"shot_order": 1, "text": "第一镜第一句"},
+            {"shot_order": 2, "text": "第二镜第二句"},
+        ],
+    })
+
+    from app.services.drama_persistence import replace_project_drama
+
+    replace_project_drama(database, project_id, drama)
+
+    with session_scope(database) as session:
+        shots = {shot.order: shot for shot in session.query(Shot).all()}
+        assert [(item.order, item.text) for item in shots[1].dialogues] == [
+            (1, "第一镜第一句"),
+        ]
+        assert [(item.order, item.text) for item in shots[2].dialogues] == [
+            (1, "第二镜第一句"),
+            (2, "第二镜第二句"),
+        ]
+
+
 @pytest.mark.parametrize(
     ("duplicate_kind", "expected_error"),
     [
