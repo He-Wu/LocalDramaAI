@@ -9,6 +9,7 @@ htmlcov/
 .venv/
 venv/
 env-*/
+.worktrees/
 
 # Local configuration and credentials
 .env
