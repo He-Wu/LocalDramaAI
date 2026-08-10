@@ -30,7 +30,18 @@ def create_schema(database_url: str):
     if database_url.startswith("sqlite:///"):
         Path(database_url.removeprefix("sqlite:///" )).parent.mkdir(parents=True, exist_ok=True)
     from app import models  # noqa: F401
-    Base.metadata.create_all(get_engine(database_url))
+    engine = get_engine(database_url)
+    Base.metadata.create_all(engine)
+    if engine.dialect.name == "sqlite":
+        with engine.begin() as connection:
+            columns = {
+                row[1]
+                for row in connection.exec_driver_sql("PRAGMA table_info(generation_jobs)")
+            }
+            if "cancel_requested_at" not in columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE generation_jobs ADD COLUMN cancel_requested_at DATETIME"
+                )
 
 @contextmanager
 def session_scope(database_url: str):
