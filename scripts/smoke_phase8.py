@@ -15,6 +15,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import socket
 import subprocess
 import time
@@ -54,7 +55,17 @@ DEFAULT_MUSETALK_URL = "http://127.0.0.1:8030"
 DEFAULT_MUSETALK_PYTHON = Path("E:/LocalDramaAI/env-musetalk/Scripts/python.exe")
 DEFAULT_MUSETALK_REPO = Path("E:/LocalDramaAI/MuseTalk")
 DEFAULT_FFMPEG_BIN = Path("E:/LocalDramaAI/ffmpeg/bin")
+EXPECTED_MUSETALK_COMMIT = "0a89dec45a0192b824e3cf4daf96c239440c5ed8"
+DEFAULT_MODEL_LOCK = ROOT / "scripts" / "musetalk-models.lock.json"
 _MP4_MOV_FORMATS = {"mov", "mp4", "m4a", "3gp", "3g2", "mj2"}
+_RUN_ID = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?", re.ASCII)
+_SHA256 = re.compile(r"[0-9a-f]{64}", re.ASCII)
+_GIT_COMMIT = re.compile(r"[0-9a-f]{40}", re.ASCII)
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{number}" for number in range(1, 10)),
+    *(f"LPT{number}" for number in range(1, 10)),
+}
 _VISUAL_REVIEW_CHECKLIST = (
     "no visible jaw or hand seam",
     "no mask edge",
@@ -98,6 +109,177 @@ def sha256_file(path: Path) -> str:
     except OSError as exc:
         raise RuntimeError(f"cannot hash evidence file: {path}") from exc
     return digest.hexdigest()
+
+
+def _run_git(repository: Path, *arguments: str) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-c", f"safe.directory={repository}", "-C", str(repository), *arguments],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            shell=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"cannot inspect MuseTalk Git checkout: {repository}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()[-1000:]
+        raise RuntimeError(f"cannot inspect MuseTalk Git checkout: {detail}")
+    return result.stdout.strip()
+
+
+def _load_json_array(path: Path, label: str) -> list[dict[str, Any]]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"{label} is not valid JSON: {path}") from exc
+    if not isinstance(payload, list) or not all(isinstance(record, dict) for record in payload):
+        raise RuntimeError(f"{label} must be a JSON array of objects: {path}")
+    return payload
+
+
+def _model_tuple(record: dict[str, Any], *, include_source: bool) -> dict[str, Any]:
+    required = {"repository", "revision", "path", "bytes", "sha256"}
+    if include_source:
+        required.add("source")
+    if not required.issubset(record):
+        raise RuntimeError("MuseTalk model lock tuple is missing required fields")
+    result = {key: record[key] for key in ("path", "repository", "revision", "bytes", "sha256")}
+    if (
+        not isinstance(result["path"], str)
+        or not result["path"].startswith("models/")
+        or "\\" in result["path"]
+        or not isinstance(result["repository"], str)
+        or "/" not in result["repository"]
+        or not isinstance(result["revision"], str)
+        or _GIT_COMMIT.fullmatch(result["revision"].lower()) is None
+        or isinstance(result["bytes"], bool)
+        or not isinstance(result["bytes"], int)
+        or result["bytes"] <= 0
+        or not isinstance(result["sha256"], str)
+        or _SHA256.fullmatch(result["sha256"].lower()) is None
+    ):
+        raise RuntimeError(f"MuseTalk model lock tuple is invalid: {result.get('path')}")
+    result["revision"] = result["revision"].lower()
+    result["sha256"] = result["sha256"].lower()
+    return result
+
+
+def attest_musetalk_runtime(
+    repository: Path,
+    expected_commit: str,
+    model_lock_path: Path = DEFAULT_MODEL_LOCK,
+) -> dict[str, Any]:
+    """Attest a clean exact Git checkout and every authoritative model byte."""
+    repository = Path(repository).resolve()
+    model_lock_path = Path(model_lock_path).resolve()
+    if not repository.is_dir() or not (repository / ".git").exists():
+        raise RuntimeError(f"MuseTalk Git checkout is missing: {repository}")
+    if not isinstance(expected_commit, str) or _GIT_COMMIT.fullmatch(expected_commit.lower()) is None:
+        raise RuntimeError("configured MuseTalk Git commit is invalid")
+    actual_commit = _run_git(repository, "rev-parse", "HEAD").lower()
+    if actual_commit != expected_commit.lower():
+        raise RuntimeError(
+            f"MuseTalk Git HEAD mismatch: expected {expected_commit.lower()}, got {actual_commit}"
+        )
+    dirty = _run_git(repository, "status", "--porcelain=v1", "--untracked-files=normal")
+    if dirty:
+        raise RuntimeError("MuseTalk Git checkout must be clean before PHASE 8 smoke")
+
+    locked_records = _load_json_array(model_lock_path, "authoritative MuseTalk model lock")
+    if len(locked_records) != 11:
+        raise RuntimeError(
+            f"authoritative MuseTalk model lock must contain exactly 11 records; got {len(locked_records)}"
+        )
+    locked_models = [_model_tuple(record, include_source=True) for record in locked_records]
+    locked_by_path = {record["path"]: record for record in locked_models}
+    if len(locked_by_path) != 11:
+        raise RuntimeError("authoritative MuseTalk model lock contains duplicate paths")
+
+    manifest_path = repository / "models" / "model-hashes.json"
+    manifest_records = _load_json_array(manifest_path, "MuseTalk model hash manifest")
+    if len(manifest_records) != 11:
+        raise RuntimeError(
+            f"MuseTalk model hash manifest must contain exactly 11 records; got {len(manifest_records)}"
+        )
+    manifest_models = [_model_tuple(record, include_source=False) for record in manifest_records]
+    manifest_by_path = {record["path"]: record for record in manifest_models}
+    if len(manifest_by_path) != 11 or set(manifest_by_path) != set(locked_by_path):
+        raise RuntimeError("MuseTalk model manifest paths differ from the authoritative lock")
+
+    models_root = (repository / "models").resolve()
+    for relative_path, expected in locked_by_path.items():
+        if manifest_by_path[relative_path] != expected:
+            raise RuntimeError(f"MuseTalk model manifest tuple differs from lock: {relative_path}")
+        model_path = (repository / relative_path).resolve()
+        try:
+            model_path.relative_to(models_root)
+        except ValueError as exc:
+            raise RuntimeError(f"MuseTalk model path escapes models root: {relative_path}") from exc
+        if not model_path.is_file():
+            raise RuntimeError(f"MuseTalk model file is missing: {model_path}")
+        measured_bytes = model_path.stat().st_size
+        if measured_bytes != expected["bytes"]:
+            raise RuntimeError(
+                f"MuseTalk model byte count mismatch for {relative_path}: "
+                f"expected {expected['bytes']}, got {measured_bytes}"
+            )
+        measured_hash = sha256_file(model_path)
+        if measured_hash != expected["sha256"]:
+            raise RuntimeError(
+                f"MuseTalk model SHA256 mismatch for {relative_path}: "
+                f"expected {expected['sha256']}, got {measured_hash}"
+            )
+
+    canonical = json.dumps(locked_models, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return {
+        "repo_path": str(repository),
+        "repo_commit": actual_commit,
+        "repo_clean": True,
+        "model_count": 11,
+        "model_identity_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "model_lock": {"path": str(model_lock_path), "sha256": sha256_file(model_lock_path)},
+        "model_manifest": {"path": str(manifest_path.resolve()), "sha256": sha256_file(manifest_path)},
+        "models": locked_models,
+    }
+
+
+def validate_run_id(value: str) -> str:
+    if not isinstance(value, str) or _RUN_ID.fullmatch(value) is None:
+        raise ValueError("PHASE 8 run ID must be 1-128 separator-free ASCII letters, digits, dot, underscore, or hyphen")
+    if value in {".", ".."} or value.split(".", 1)[0].upper() in _WINDOWS_RESERVED_NAMES:
+        raise ValueError("PHASE 8 run ID is a reserved filesystem name")
+    return value
+
+
+def _contained_path(path: Path, root: Path, label: str) -> Path:
+    resolved = Path(path).resolve()
+    root = Path(root).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise RuntimeError(f"PHASE 8 {label} path escapes its evidence root: {resolved}") from exc
+    return resolved
+
+
+def build_evidence_paths(evidence_root: Path, run_id: str) -> dict[str, Path]:
+    evidence_root = Path(evidence_root).resolve()
+    run_id = validate_run_id(run_id)
+    artifacts_root = (evidence_root / "artifacts").resolve()
+    runtime_root = (evidence_root / ".runtime").resolve()
+    logs_root = (evidence_root / "logs").resolve()
+    run_dir = _contained_path(artifacts_root / "phase8" / run_id, artifacts_root, "artifact")
+    return {
+        "run_dir": run_dir,
+        "output_dir": _contained_path(run_dir / "output", artifacts_root, "output"),
+        "review_dir": _contained_path(run_dir / "review", artifacts_root, "review"),
+        "resources": _contained_path(run_dir / "resources.json", artifacts_root, "resources"),
+        "evidence": _contained_path(run_dir / "evidence.json", artifacts_root, "evidence"),
+        "database": _contained_path(
+            runtime_root / "phase8" / f"phase8-smoke-{run_id}.db", runtime_root, "database"
+        ),
+        "log": _contained_path(logs_root / f"musetalk-phase8-{run_id}.log", logs_root, "log"),
+    }
 
 
 def _require_sha256(path: Path, expected: str, label: str) -> str:
@@ -787,27 +969,85 @@ def _start_service(
     )
 
 
-def stop_process_tree(process: subprocess.Popen | None) -> None:
-    if process is None or process.poll() is not None:
+def capture_owned_descendants(
+    process: subprocess.Popen | None,
+    captured: set[tuple[int, float]],
+) -> None:
+    if process is None:
         return
-    if os.name == "nt":
-        try:
-            subprocess.run(
-                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                shell=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            process.terminate()
-    else:
-        process.terminate()
     try:
-        process.wait(timeout=30)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=10)
+        descendants = psutil.Process(process.pid).children(recursive=True)
+    except (psutil.Error, OSError):
+        return
+    for descendant in descendants:
+        try:
+            captured.add((descendant.pid, descendant.create_time()))
+        except (psutil.Error, OSError):
+            continue
+
+
+async def monitor_owned_descendants(
+    process: subprocess.Popen,
+    captured: set[tuple[int, float]],
+    stop: asyncio.Event,
+) -> None:
+    while not stop.is_set():
+        capture_owned_descendants(process, captured)
+        await asyncio.sleep(0.1)
+    capture_owned_descendants(process, captured)
+
+
+def stop_process_tree(
+    process: subprocess.Popen | None,
+    captured_descendants: Iterable[tuple[int, float]] = (),
+) -> None:
+    """Stop only the launched parent and descendants proven to have belonged to it."""
+    parent_alive = process is not None and process.poll() is None
+    if parent_alive and process is not None:
+        if os.name == "nt":
+            taskkill_failed = False
+            try:
+                result = subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    shell=False,
+                )
+                taskkill_failed = result.returncode != 0
+            except (OSError, subprocess.TimeoutExpired):
+                taskkill_failed = True
+            if taskkill_failed and process.poll() is None:
+                process.terminate()
+        else:
+            process.terminate()
+        try:
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=10)
+
+    owned: list[psutil.Process] = []
+    for pid, create_time in set(captured_descendants):
+        try:
+            candidate = psutil.Process(pid)
+            if abs(candidate.create_time() - create_time) <= 1e-6 and candidate.is_running():
+                owned.append(candidate)
+        except (psutil.Error, OSError):
+            continue
+    for descendant in owned:
+        try:
+            descendant.terminate()
+        except (psutil.Error, OSError):
+            continue
+    _, alive = psutil.wait_procs(owned, timeout=5)
+    for descendant in alive:
+        try:
+            descendant.kill()
+        except (psutil.Error, OSError):
+            continue
+    if alive:
+        psutil.wait_procs(alive, timeout=5)
 
 
 async def _wait_for_health(provider: MuseTalkProvider, timeout: float = 180.0) -> dict[str, Any]:
@@ -838,16 +1078,22 @@ def _file_evidence(path: Path) -> dict[str, str]:
 
 async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
     base_url = validate_musetalk_url(args.musetalk_url)
-    assert_ports_free()
     evidence_root = Path(args.evidence_root).resolve()
-    run_id = args.run_id or _new_run_id()
-    run_dir = evidence_root / "artifacts" / "phase8" / run_id
-    output_dir = run_dir / "output"
-    review_dir = run_dir / "review"
-    database_path = evidence_root / ".runtime" / "phase8" / f"phase8-smoke-{run_id}.db"
-    resources_path = run_dir / "resources.json"
-    evidence_path = run_dir / "evidence.json"
-    log_path = evidence_root / "logs" / f"musetalk-phase8-{run_id}.log"
+    run_id = validate_run_id(args.run_id or _new_run_id())
+    paths = build_evidence_paths(evidence_root, run_id)
+    run_dir = paths["run_dir"]
+    output_dir = paths["output_dir"]
+    review_dir = paths["review_dir"]
+    database_path = paths["database"]
+    resources_path = paths["resources"]
+    evidence_path = paths["evidence"]
+    log_path = paths["log"]
+    runtime_identity = attest_musetalk_runtime(
+        Path(args.musetalk_repo),
+        args.repo_commit,
+        Path(args.model_lock),
+    )
+    assert_ports_free()
     for directory in (output_dir, review_dir, database_path.parent, log_path.parent):
         directory.mkdir(parents=True, exist_ok=True)
     seeded = seed_phase8_database(database_path)
@@ -861,14 +1107,19 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
     monitor = asyncio.create_task(monitor_resources(stop_monitor, samples, started=started))
     primary_error: BaseException | None = None
     cleanup_errors: list[Exception] = []
+    owned_descendants: set[tuple[int, float]] = set()
+    descendant_monitor: asyncio.Task[None] | None = None
     result: dict[str, Any] | None = None
     try:
         service_process = _start_service(
             Path(args.service_python),
             Path(args.musetalk_repo),
             Path(args.ffmpeg_bin),
-            args.repo_commit,
+            runtime_identity["repo_commit"],
             log_handle,
+        )
+        descendant_monitor = asyncio.create_task(
+            monitor_owned_descendants(service_process, owned_descendants, stop_monitor)
         )
         provider = MuseTalkProvider(base_url, timeout=args.generation_timeout)
         health = await _wait_for_health(provider, timeout=args.health_timeout)
@@ -924,6 +1175,7 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 "mouth_contact_sheet": _file_evidence(review_artifacts[3]),
             },
             "health": health,
+            "musetalk_runtime": runtime_identity,
             "elapsed_seconds": round(time.monotonic() - started, 3),
             "service_log": str(log_path.resolve()),
         }
@@ -936,6 +1188,11 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
             except Exception as exc:
                 cleanup_errors.append(exc)
         stop_monitor.set()
+        if descendant_monitor is not None:
+            try:
+                await descendant_monitor
+            except Exception as exc:
+                cleanup_errors.append(exc)
         try:
             await monitor
         except Exception as exc:
@@ -948,7 +1205,7 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 )
             except Exception as exc:
                 cleanup_errors.append(exc)
-        stop_process_tree(service_process)
+        stop_process_tree(service_process, owned_descendants)
         log_handle.close()
         try:
             await wait_ports_free()
@@ -999,12 +1256,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--service-python", type=Path, default=DEFAULT_MUSETALK_PYTHON)
     parser.add_argument("--musetalk-repo", type=Path, default=DEFAULT_MUSETALK_REPO)
+    parser.add_argument("--model-lock", type=Path, default=DEFAULT_MODEL_LOCK)
     parser.add_argument("--ffmpeg-bin", type=Path, default=DEFAULT_FFMPEG_BIN)
     parser.add_argument(
         "--repo-commit",
         default=os.environ.get(
             "LOCALDRAMA_MUSETALK_REPO_COMMIT",
-            "0a89dec45a0192b824e3cf4daf96c239440c5ed8",
+            EXPECTED_MUSETALK_COMMIT,
         ),
     )
     parser.add_argument("--ffmpeg", default="ffmpeg")

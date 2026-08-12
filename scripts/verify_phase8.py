@@ -13,6 +13,7 @@ import yaml
 from app.services.media_probe import AVInfo, probe_av
 from scripts.smoke_phase8 import (
     AI_PORTS,
+    attest_musetalk_runtime,
     assert_ports_free,
     decode_media,
     resource_peaks,
@@ -102,6 +103,19 @@ def _same_path(left: Path, right: Path, label: str) -> None:
         raise RuntimeError(f"locked {label} paths disagree: {left} != {right}")
 
 
+def _runtime_identity_matches(evidence: dict[str, Any], actual: dict[str, Any]) -> bool:
+    """Compare identity, allowing only the project worktree's lock path to move."""
+    evidence_copy = dict(evidence)
+    actual_copy = dict(actual)
+    evidence_lock = evidence_copy.get("model_lock")
+    actual_lock = actual_copy.get("model_lock")
+    if not isinstance(evidence_lock, dict) or not isinstance(actual_lock, dict):
+        return False
+    evidence_copy["model_lock"] = {"sha256": evidence_lock.get("sha256")}
+    actual_copy["model_lock"] = {"sha256": actual_lock.get("sha256")}
+    return evidence_copy == actual_copy
+
+
 def verify_phase8(
     lock_path: Path = DEFAULT_LOCK,
     *,
@@ -115,6 +129,38 @@ def verify_phase8(
     evidence_root = repo_root if evidence_root is None else Path(evidence_root).resolve()
     allowed_roots = tuple(dict.fromkeys((repo_root, evidence_root)))
     payload = _load_yaml_object(Path(lock_path).resolve())
+    musetalk = payload.get("musetalk")
+    if not isinstance(musetalk, dict):
+        raise RuntimeError("runtime lock has no MuseTalk runtime mapping")
+    repository_value = musetalk.get("path")
+    if not isinstance(repository_value, str) or not repository_value.strip():
+        raise RuntimeError("runtime lock has no MuseTalk repository path")
+    try:
+        musetalk_repository = Path(repository_value).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError("runtime lock MuseTalk repository path is missing") from exc
+    if not musetalk_repository.is_dir():
+        raise RuntimeError("runtime lock MuseTalk repository path is not a directory")
+    expected_commit = musetalk.get("commit_or_release")
+    model_lock_path = (repo_root / "scripts" / "musetalk-models.lock.json").resolve()
+    runtime_identity = attest_musetalk_runtime(
+        musetalk_repository,
+        expected_commit,
+        model_lock_path,
+    )
+    configured_manifest_value = musetalk.get("model_hash_manifest")
+    if not isinstance(configured_manifest_value, str) or not configured_manifest_value.strip():
+        raise RuntimeError("runtime lock has no MuseTalk model hash manifest path")
+    try:
+        configured_manifest = Path(configured_manifest_value).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError("runtime lock MuseTalk model hash manifest is missing") from exc
+    if configured_manifest != Path(runtime_identity["model_manifest"]["path"]):
+        raise RuntimeError("runtime lock MuseTalk model manifest path disagrees with attestation")
+    configured_manifest_sha256 = musetalk.get("model_hash_manifest_sha256")
+    if configured_manifest_sha256 != runtime_identity["model_manifest"]["sha256"]:
+        raise RuntimeError("runtime lock MuseTalk model manifest SHA256 disagrees with attestation")
+
     verification = payload.get("verification")
     if not isinstance(verification, dict):
         raise RuntimeError("runtime lock has no verification mapping")
@@ -164,6 +210,11 @@ def verify_phase8(
         raise RuntimeError("locked evidence JSON project_id is missing")
     if not isinstance(shot_id, str) or not shot_id:
         raise RuntimeError("locked evidence JSON shot_id is missing")
+    evidence_runtime = evidence.get("musetalk_runtime")
+    if not isinstance(evidence_runtime, dict) or not _runtime_identity_matches(
+        evidence_runtime, runtime_identity
+    ):
+        raise RuntimeError("locked evidence MuseTalk runtime identity disagrees with current attestation")
     evidence_database = resolve_locked_path(
         evidence.get("database"), allowed_roots, "evidence database"
     )
@@ -257,6 +308,7 @@ def verify_phase8(
         },
         "database_links": database,
         "resource_peaks": measured_peaks,
+        "musetalk_runtime": runtime_identity,
     }
 
 
