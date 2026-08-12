@@ -221,18 +221,25 @@ class FinalRenderService:
             try:
                 self.ffmpeg.concat(normalized, candidate)
                 metadata = self._final_video_metadata(candidate, input_hashes, shots)
-                candidate.replace(output_path)
+                asset_id = self._publish_registered_asset(
+                    project_id,
+                    kind="FINAL_VIDEO",
+                    candidate=candidate,
+                    destination=output_path,
+                    mime_type="video/mp4",
+                    metadata=metadata,
+                )
             finally:
                 candidate.unlink(missing_ok=True)
         else:
             metadata = self._final_video_metadata(output_path, input_hashes, shots)
-        asset_id = self._register_single_asset(
-            project_id,
-            kind="FINAL_VIDEO",
-            path=output_path,
-            mime_type="video/mp4",
-            metadata=metadata,
-        )
+            asset_id = self._register_single_asset(
+                project_id,
+                kind="FINAL_VIDEO",
+                path=output_path,
+                mime_type="video/mp4",
+                metadata=metadata,
+            )
         return {
             "asset_id": asset_id,
             "path": str(output_path),
@@ -262,24 +269,28 @@ class FinalRenderService:
             text += "\n"
         payload = codecs.BOM_UTF8 + text.encode("utf-8")
         output_path = self._project_dir(project_id) / "subtitles.srt"
-        if not output_path.is_file() or output_path.read_bytes() != payload:
-            _atomic_write(output_path, payload)
-        if output_path.read_bytes() != payload:
-            raise RuntimeError("subtitle export validation failed")
-        metadata = {
-            "sha256": _sha256(output_path),
-            "size": output_path.stat().st_size,
-            "entries": sequence - 1,
-            "timeline_duration_ms": _milliseconds(shot_cursor),
-            "encoding": "utf-8-sig",
-        }
-        asset_id = self._register_single_asset(
-            project_id,
-            kind="SUBTITLE",
-            path=output_path,
-            mime_type="application/x-subrip",
-            metadata=metadata,
-        )
+        candidate = self.ffmpeg._temporary_path(output_path)
+        try:
+            candidate.write_bytes(payload)
+            if candidate.read_bytes() != payload:
+                raise RuntimeError("subtitle export validation failed")
+            metadata = {
+                "sha256": _sha256(candidate),
+                "size": candidate.stat().st_size,
+                "entries": sequence - 1,
+                "timeline_duration_ms": _milliseconds(shot_cursor),
+                "encoding": "utf-8-sig",
+            }
+            asset_id = self._publish_registered_asset(
+                project_id,
+                kind="SUBTITLE",
+                candidate=candidate,
+                destination=output_path,
+                mime_type="application/x-subrip",
+                metadata=metadata,
+            )
+        finally:
+            candidate.unlink(missing_ok=True)
         return {
             "asset_id": asset_id,
             "path": str(output_path),
@@ -296,6 +307,34 @@ class FinalRenderService:
             project = session.get(Project, project_id)
             if project is None:
                 raise ValueError(f"Project not found: {project_id}")
+            for shot in shots:
+                storyboard_asset_id = shot["storyboard_asset_id"]
+                if storyboard_asset_id is None:
+                    continue
+                storyboard = session.get(Asset, storyboard_asset_id)
+                if storyboard is None or storyboard.project_id != project_id:
+                    raise ValueError(
+                        "shot storyboard asset does not belong to project"
+                    )
+                if storyboard.kind != "IMAGE":
+                    raise ValueError("shot storyboard asset must have kind IMAGE")
+                storyboard_path = Path(storyboard.path)
+                if (
+                    not storyboard_path.is_file()
+                    or storyboard_path.stat().st_size <= 0
+                ):
+                    raise ValueError(
+                        f"shot storyboard file is missing or empty: {storyboard_path}"
+                    )
+                storyboard_metadata = storyboard.metadata_json
+                if (
+                    isinstance(storyboard_metadata, dict)
+                    and storyboard_metadata.get("sha256") is not None
+                    and storyboard_metadata["sha256"] != _sha256(storyboard_path)
+                ):
+                    raise ValueError(
+                        "shot storyboard file does not match registered evidence"
+                    )
             final_asset = session.get(Asset, final_video_asset_id)
             if final_asset is None or final_asset.project_id != project_id:
                 raise ValueError("final video asset does not belong to project")
@@ -460,27 +499,32 @@ class FinalRenderService:
             json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         ).encode("utf-8")
         output_path = self._project_dir(project_id) / "manifest.json"
-        if not output_path.is_file() or output_path.read_bytes() != payload:
-            _atomic_write(output_path, payload)
+        candidate = self.ffmpeg._temporary_path(output_path)
         try:
-            if json.loads(output_path.read_text(encoding="utf-8")) != manifest:
+            candidate.write_bytes(payload)
+            try:
+                decoded = json.loads(candidate.read_text(encoding="utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("manifest export validation failed") from exc
+            if decoded != manifest:
                 raise RuntimeError("manifest export validation failed")
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise RuntimeError("manifest export validation failed") from exc
-        sha256 = _sha256(output_path)
-        metadata = {
-            "sha256": sha256,
-            "size": output_path.stat().st_size,
-            "final_video_asset_id": final_video_asset_id,
-            "schema_version": 1,
-        }
-        asset_id = self._register_single_asset(
-            project_id,
-            kind="MANIFEST",
-            path=output_path,
-            mime_type="application/json",
-            metadata=metadata,
-        )
+            sha256 = _sha256(candidate)
+            metadata = {
+                "sha256": sha256,
+                "size": candidate.stat().st_size,
+                "final_video_asset_id": final_video_asset_id,
+                "schema_version": 1,
+            }
+            asset_id = self._publish_registered_asset(
+                project_id,
+                kind="MANIFEST",
+                candidate=candidate,
+                destination=output_path,
+                mime_type="application/json",
+                metadata=metadata,
+            )
+        finally:
+            candidate.unlink(missing_ok=True)
         return {
             "asset_id": asset_id,
             "path": str(output_path),
@@ -762,6 +806,70 @@ class FinalRenderService:
             asset.metadata_json = metadata
             session.flush()
             return asset.id
+
+    def _publish_registered_asset(
+        self,
+        project_id: str,
+        *,
+        kind: str,
+        candidate: Path,
+        destination: Path,
+        mime_type: str,
+        metadata: dict[str, Any],
+    ) -> str:
+        candidate = Path(candidate)
+        destination = Path(destination)
+        if not candidate.is_file() or candidate.stat().st_size <= 0:
+            raise ValueError(f"cannot publish missing or empty {kind} candidate")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        backup: Path | None = None
+        old_moved = False
+        new_published = False
+        if destination.exists():
+            descriptor, backup_name = tempfile.mkstemp(
+                prefix=f".{destination.stem}.",
+                suffix=f".bak{destination.suffix}",
+                dir=destination.parent,
+            )
+            os.close(descriptor)
+            backup = Path(backup_name)
+        try:
+            if backup is not None:
+                destination.replace(backup)
+                old_moved = True
+            candidate.replace(destination)
+            new_published = True
+            asset_id = self._register_single_asset(
+                project_id,
+                kind=kind,
+                path=destination,
+                mime_type=mime_type,
+                metadata=metadata,
+            )
+        except Exception:
+            if old_moved and backup is not None:
+                backup.replace(destination)
+                old_moved = False
+                new_published = False
+            elif new_published:
+                destination.unlink(missing_ok=True)
+                new_published = False
+            raise
+        else:
+            if old_moved and backup is not None:
+                old_moved = False
+                try:
+                    backup.unlink()
+                except OSError:
+                    pass
+            return asset_id
+        finally:
+            candidate.unlink(missing_ok=True)
+            if backup is not None and backup.exists() and not old_moved:
+                try:
+                    backup.unlink()
+                except OSError:
+                    pass
 
     @staticmethod
     def _valid_file_hash(path: Path, expected_hash: str | None) -> bool:

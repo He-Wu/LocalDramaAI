@@ -659,6 +659,39 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _asset_snapshot(database: str, asset_id: str) -> tuple[str, str, dict]:
+    with session_scope(database) as session:
+        asset = session.get(Asset, asset_id)
+        return asset.path, asset.mime_type, dict(asset.metadata_json)
+
+
+def _reject_asset_update(database: str, kind: str) -> None:
+    trigger_name = f"reject_{kind.lower()}_update"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            f"""
+            CREATE TRIGGER {trigger_name}
+            BEFORE UPDATE ON assets
+            WHEN OLD.kind = '{kind}'
+            BEGIN
+                SELECT RAISE(ABORT, '{kind} registration rejected');
+            END
+            """
+        )
+
+
+def _publish_leaks(project_dir: Path) -> list[Path]:
+    if not project_dir.exists():
+        return []
+    return [
+        path
+        for path in project_dir.rglob("*")
+        if path.is_file()
+        and path.name.startswith(".")
+        and (".tmp" in path.name or ".bak" in path.name)
+    ]
+
+
 def test_export_subtitles_uses_persisted_dialogue_durations_and_media_tails(tmp_path):
     seed = _seed_render_project(tmp_path)
     service = _render_service(seed, tmp_path)
@@ -987,7 +1020,137 @@ def test_database_registration_failure_rolls_back_asset_row(tmp_path):
     with session_scope(seed["database"]) as session:
         assert session.query(Asset).filter_by(kind="FINAL_VIDEO").count() == 0
     final_path = tmp_path / "exports" / seed["project_id"] / "final.mp4"
-    assert _probe(final_path)["streams"]
+    assert not final_path.exists()
+    assert _publish_leaks(final_path.parent) == []
+
+
+def test_final_update_failure_restores_prior_file_and_asset_metadata(tmp_path):
+    seed = _seed_render_project(tmp_path)
+    service = _render_service(seed, tmp_path)
+    muxed = service.mux_shots(seed["project_id"])["muxed_paths"]
+    final = service.concat_project(seed["project_id"], muxed)
+    final_path = Path(final["path"])
+    prior_bytes = final_path.read_bytes()
+    prior_asset = _asset_snapshot(seed["database"], final["asset_id"])
+    _video(
+        FFmpegProvider(),
+        seed["source_videos"][0],
+        (130, 30, 120),
+        seconds=1.3,
+    )
+    changed_muxed = service.mux_shots(seed["project_id"])["muxed_paths"]
+    _reject_asset_update(seed["database"], "FINAL_VIDEO")
+
+    with pytest.raises(IntegrityError, match="FINAL_VIDEO registration rejected"):
+        service.concat_project(seed["project_id"], changed_muxed)
+
+    assert final_path.read_bytes() == prior_bytes
+    assert _sha256(final_path) == prior_asset[2]["sha256"]
+    assert _asset_snapshot(seed["database"], final["asset_id"]) == prior_asset
+    assert _publish_leaks(final_path.parent) == []
+
+
+def test_subtitle_update_failure_restores_prior_file_and_asset_metadata(tmp_path):
+    seed = _seed_render_project(tmp_path)
+    service = _render_service(seed, tmp_path)
+    subtitle = service.export_subtitles(seed["project_id"])
+    subtitle_path = Path(subtitle["path"])
+    prior_bytes = subtitle_path.read_bytes()
+    prior_asset = _asset_snapshot(seed["database"], subtitle["asset_id"])
+    with session_scope(seed["database"]) as session:
+        session.query(Dialogue).filter_by(
+            audio_asset_id=seed["audio_asset_ids"][0]
+        ).one().text = "被拒绝的新字幕"
+    _reject_asset_update(seed["database"], "SUBTITLE")
+
+    with pytest.raises(IntegrityError, match="SUBTITLE registration rejected"):
+        service.export_subtitles(seed["project_id"])
+
+    assert subtitle_path.read_bytes() == prior_bytes
+    assert _sha256(subtitle_path) == prior_asset[2]["sha256"]
+    assert _asset_snapshot(seed["database"], subtitle["asset_id"]) == prior_asset
+    assert _publish_leaks(subtitle_path.parent) == []
+
+
+def test_manifest_update_failure_restores_prior_file_and_asset_metadata(tmp_path):
+    seed = _seed_render_project(tmp_path)
+    service = _render_service(seed, tmp_path)
+    muxed = service.mux_shots(seed["project_id"])["muxed_paths"]
+    final = service.concat_project(seed["project_id"], muxed)
+    manifest = service.export_manifest(seed["project_id"], final["asset_id"])
+    manifest_path = Path(manifest["path"])
+    prior_bytes = manifest_path.read_bytes()
+    prior_asset = _asset_snapshot(seed["database"], manifest["asset_id"])
+    with session_scope(seed["database"]) as session:
+        session.get(Project, seed["project_id"]).description = "被拒绝的新项目描述"
+    _reject_asset_update(seed["database"], "MANIFEST")
+
+    with pytest.raises(IntegrityError, match="MANIFEST registration rejected"):
+        service.export_manifest(seed["project_id"], final["asset_id"])
+
+    assert manifest_path.read_bytes() == prior_bytes
+    assert _sha256(manifest_path) == prior_asset[2]["sha256"]
+    assert _asset_snapshot(seed["database"], manifest["asset_id"]) == prior_asset
+    assert _publish_leaks(manifest_path.parent) == []
+
+
+def test_registration_rollback_atomically_replaces_destination_without_unlink(
+    tmp_path, monkeypatch
+):
+    seed = _seed_render_project(tmp_path)
+    service = _render_service(seed, tmp_path)
+    subtitle = service.export_subtitles(seed["project_id"])
+    subtitle_path = Path(subtitle["path"])
+    prior_bytes = subtitle_path.read_bytes()
+    with session_scope(seed["database"]) as session:
+        session.query(Dialogue).filter_by(
+            audio_asset_id=seed["audio_asset_ids"][0]
+        ).one().text = "触发原子恢复"
+    _reject_asset_update(seed["database"], "SUBTITLE")
+    original_unlink = Path.unlink
+
+    def reject_destination_unlink(path, *args, **kwargs):
+        if path == subtitle_path:
+            raise AssertionError("rollback must replace destination without an unlink gap")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", reject_destination_unlink)
+
+    with pytest.raises(IntegrityError, match="SUBTITLE registration rejected"):
+        service.export_subtitles(seed["project_id"])
+
+    assert subtitle_path.read_bytes() == prior_bytes
+    assert _publish_leaks(subtitle_path.parent) == []
+
+
+def test_post_commit_backup_cleanup_retries_without_failing_export(
+    tmp_path, monkeypatch
+):
+    seed = _seed_render_project(tmp_path)
+    service = _render_service(seed, tmp_path)
+    subtitle = service.export_subtitles(seed["project_id"])
+    with session_scope(seed["database"]) as session:
+        session.query(Dialogue).filter_by(
+            audio_asset_id=seed["audio_asset_ids"][0]
+        ).one().text = "提交后的新字幕"
+    original_unlink = Path.unlink
+    failed_once = False
+
+    def fail_first_backup_cleanup(path, *args, **kwargs):
+        nonlocal failed_once
+        if ".bak" in path.name and not failed_once:
+            failed_once = True
+            raise OSError("transient backup cleanup failure")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_first_backup_cleanup)
+
+    updated = service.export_subtitles(seed["project_id"])
+
+    assert updated["asset_id"] == subtitle["asset_id"]
+    assert "提交后的新字幕" in Path(updated["path"]).read_text(encoding="utf-8-sig")
+    assert failed_once
+    assert _publish_leaks(Path(updated["path"]).parent) == []
 
 
 def test_concat_rejects_stale_mux_evidence(tmp_path):
@@ -1107,6 +1270,41 @@ def test_manifest_allows_non_asset_generation_provenance_tokens(tmp_path):
     assert payload["generation_manifests"][0]["input_assets"] == [
         "phase4_reference_image.png"
     ]
+
+
+def test_manifest_rejects_cross_project_storyboard_and_preserves_prior(tmp_path):
+    seed = _seed_render_project(tmp_path)
+    service = _render_service(seed, tmp_path)
+    muxed = service.mux_shots(seed["project_id"])["muxed_paths"]
+    final = service.concat_project(seed["project_id"], muxed)
+    manifest = service.export_manifest(seed["project_id"], final["asset_id"])
+    manifest_path = Path(manifest["path"])
+    prior_bytes = manifest_path.read_bytes()
+    prior_asset = _asset_snapshot(seed["database"], manifest["asset_id"])
+    storyboard_path = tmp_path / "foreign-storyboard.png"
+    Image.new("RGB", (32, 32), (20, 40, 60)).save(storyboard_path)
+    with session_scope(seed["database"]) as session:
+        other_project = Project(name="外部 storyboard 项目")
+        session.add(other_project)
+        session.flush()
+        foreign_storyboard = Asset(
+            project_id=other_project.id,
+            kind="IMAGE",
+            path=str(storyboard_path),
+            mime_type="image/png",
+        )
+        session.add(foreign_storyboard)
+        session.flush()
+        session.get(Shot, seed["shot_ids"][0]).storyboard_asset_id = (
+            foreign_storyboard.id
+        )
+
+    with pytest.raises(ValueError, match="storyboard.*belong"):
+        service.export_manifest(seed["project_id"], final["asset_id"])
+
+    assert manifest_path.read_bytes() == prior_bytes
+    assert _asset_snapshot(seed["database"], manifest["asset_id"]) == prior_asset
+    assert _publish_leaks(manifest_path.parent) == []
 
 
 def test_project_ownership_is_enforced_for_inputs_and_final_asset(tmp_path):
