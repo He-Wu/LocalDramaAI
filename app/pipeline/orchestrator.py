@@ -92,16 +92,6 @@ class PipelineOrchestrator:
             return False
         return True
 
-    @staticmethod
-    def _cancel_running_if_requested(
-        state: PipelineState,
-        stage: PipelineStage,
-    ) -> bool:
-        if not state.cancel_requested():
-            return False
-        state.mark_cancelled(stage)
-        return True
-
     async def run(self, job_id: str) -> GenerationJob:
         state = PipelineState(self.database_url, job_id)
         state.initialize()
@@ -153,9 +143,7 @@ class PipelineOrchestrator:
                     self._runtime_context(context),
                 )
             except Exception as exc:
-                if self._cancel_running_if_requested(state, stage):
-                    return self._result(job_id)
-                state.fail(
+                state.fail_or_cancel(
                     stage,
                     getattr(exc, "code", "RUNTIME_ERROR"),
                     str(exc),
@@ -164,9 +152,7 @@ class PipelineOrchestrator:
 
             output_error = self._output_error(output, "runtime output")
             if output_error is not None:
-                if self._cancel_running_if_requested(state, stage):
-                    return self._result(job_id)
-                state.fail(stage, "RUNTIME_ERROR", output_error)
+                state.fail_or_cancel(stage, "RUNTIME_ERROR", output_error)
                 return self._result(job_id)
 
             state.complete(stage, output)

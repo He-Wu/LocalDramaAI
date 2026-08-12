@@ -109,6 +109,57 @@ def test_fail_persists_stage_and_job_error_boundaries(tmp_path):
     assert events[-1].payload_json == {"stage": stage.value, "code": "SERVICE_UNAVAILABLE"}
 
 
+def test_fail_or_cancel_atomically_honors_persisted_cancellation(tmp_path):
+    database, job_id = seed(tmp_path)
+    state = PipelineState(database, job_id)
+    stage = PIPELINE_STAGES[0]
+    state.initialize()
+    state.start(stage, {})
+    state.request_cancel()
+
+    outcome = state.fail_or_cancel(stage, "LATE_FAILURE", "must not win")
+
+    job, stages, events = persisted(database, job_id)
+    assert outcome == JobStatus.CANCELLED
+    assert job.status == JobStatus.CANCELLED
+    assert job.error_code is None
+    assert stages[0].status == StageStatus.CANCELLED
+    assert stages[0].error_code is None
+    assert events[-1].event_type == "cancelled"
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED],
+)
+def test_fail_completed_output_rejects_terminal_jobs(tmp_path, terminal_status):
+    database, job_id = seed(tmp_path)
+    state = PipelineState(database, job_id)
+    stage = PIPELINE_STAGES[0]
+    state.initialize()
+    state.start(stage, {})
+    state.complete(stage, {"valid": True})
+    with session_scope(database) as session:
+        session.get(GenerationJob, job_id).status = terminal_status
+
+    with pytest.raises(ValueError, match="cannot fail completed output for job"):
+        state.fail_completed_output(
+            stage,
+            "INVALID_STAGE_OUTPUT",
+            "must not mutate terminal job",
+        )
+
+    job, stages, events = persisted(database, job_id)
+    assert job.status == terminal_status
+    assert job.error_code is None
+    assert stages[0].status == StageStatus.COMPLETED
+    assert stages[0].error_code is None
+    assert [event.event_type for event in events] == [
+        "stage_started",
+        "stage_completed",
+    ]
+
+
 def test_request_cancel_and_mark_cancelled_are_persisted(tmp_path):
     database, job_id = seed(tmp_path)
     state = PipelineState(database, job_id)

@@ -226,6 +226,58 @@ class PipelineState:
                 {"stage": stage.value, "code": code},
             )
 
+    def fail_or_cancel(
+        self,
+        stage: PipelineStage,
+        code: str,
+        message: str,
+    ) -> JobStatus:
+        """Atomically classify a running-stage error against cancellation."""
+        index = self._stage_index(stage)
+        with self._write_session() as session:
+            job = self._job(session)
+            self._require_job_status(job, "fail or cancel", (JobStatus.RUNNING,))
+            row = self._stage(session, stage)
+            self._require_status(row, "fail or cancel", (StageStatus.RUNNING,))
+            self._require_current_stage(job, stage)
+            completed_at = datetime.now(timezone.utc)
+            if job.cancel_requested_at is not None:
+                row.status = StageStatus.CANCELLED
+                row.error_code = None
+                row.error_message = None
+                row.completed_at = completed_at
+                job.status = JobStatus.CANCELLED
+                job.current_stage = stage.value
+                job.progress = max(job.progress, index / len(PIPELINE_STAGES))
+                job.output_json = None
+                job.error_code = None
+                job.error_message = None
+                job.completed_at = completed_at
+                self._event(
+                    session,
+                    "cancelled",
+                    job.progress,
+                    f"Cancelled during {stage.value}",
+                    {"stage": stage.value},
+                )
+                return JobStatus.CANCELLED
+
+            row.status = StageStatus.FAILED
+            row.error_code = code
+            row.error_message = message
+            row.completed_at = completed_at
+            job.status = JobStatus.FAILED
+            job.error_code = code
+            job.error_message = message
+            self._event(
+                session,
+                "stage_failed",
+                job.progress,
+                message,
+                {"stage": stage.value, "code": code},
+            )
+            return JobStatus.FAILED
+
     def fail_completed_output(
         self,
         stage: PipelineStage,
@@ -239,7 +291,13 @@ class PipelineState:
             self._require_job_status(
                 job,
                 "fail completed output for",
-                (JobStatus.RUNNING,),
+                (
+                    JobStatus.QUEUED,
+                    JobStatus.CLAIMED,
+                    JobStatus.PREPARING,
+                    JobStatus.RUNNING,
+                    JobStatus.INTERRUPTED,
+                ),
             )
             row = self._stage(session, stage)
             self._require_status(
@@ -247,17 +305,15 @@ class PipelineState:
                 "fail completed output for",
                 (StageStatus.COMPLETED,),
             )
-            row.status = StageStatus.FAILED
             row.error_code = code
             row.error_message = message
-            row.completed_at = datetime.now(timezone.utc)
             job.status = JobStatus.FAILED
             job.current_stage = stage.value
             job.error_code = code
             job.error_message = message
             self._event(
                 session,
-                "stage_failed",
+                "stage_output_invalid",
                 job.progress,
                 message,
                 {"stage": stage.value, "code": code},

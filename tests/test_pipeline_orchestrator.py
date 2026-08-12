@@ -1,4 +1,3 @@
-import json
 from copy import deepcopy
 
 import pytest
@@ -217,6 +216,31 @@ async def test_runtime_failure_is_persisted_and_stops_later_stages(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_cancellation_before_atomic_failure_decision_never_becomes_failed(
+    tmp_path,
+    monkeypatch,
+):
+    database_url, job_id, _ = seed(tmp_path)
+    runtime = FailingRuntime(PIPELINE_STAGES[0])
+    real_fail_or_cancel = PipelineState.fail_or_cancel
+
+    def cancel_then_decide(state, stage, code, message):
+        state.request_cancel()
+        return real_fail_or_cancel(state, stage, code, message)
+
+    monkeypatch.setattr(PipelineState, "fail_or_cancel", cancel_then_decide)
+
+    result = await PipelineOrchestrator(database_url, runtime).run(job_id)
+
+    job, stages = persisted(database_url, job_id)
+    assert result.status == job.status == JobStatus.CANCELLED
+    assert job.error_code is None
+    assert stages[PIPELINE_STAGES[0]].status == StageStatus.CANCELLED
+    assert stages[PIPELINE_STAGES[0]].error_code is None
+    assert len(runtime.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_resume_skips_completed_prefix_without_changing_attempts(tmp_path):
     database_url, job_id, _ = seed(tmp_path)
     state = PipelineState(database_url, job_id)
@@ -301,9 +325,52 @@ async def test_invalid_completed_manifest_output_becomes_diagnosable_failure(
     assert job.current_stage == PIPELINE_STAGES[-1].value
     assert job.error_code == "INVALID_STAGE_OUTPUT"
     assert job.error_message == message
-    assert manifest_stage.status == StageStatus.FAILED
+    assert manifest_stage.status == StageStatus.COMPLETED
     assert manifest_stage.error_code == "INVALID_STAGE_OUTPUT"
     assert manifest_stage.error_message == message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "resume_status",
+    [
+        JobStatus.QUEUED,
+        JobStatus.CLAIMED,
+        JobStatus.PREPARING,
+        JobStatus.INTERRUPTED,
+    ],
+)
+async def test_invalid_completed_output_fails_canonical_resume_states(
+    tmp_path,
+    resume_status,
+):
+    database_url, job_id, _ = seed(tmp_path)
+    state = PipelineState(database_url, job_id)
+    state.initialize()
+    first_stage, retry_stage = PIPELINE_STAGES[:2]
+    state.start(first_stage, {})
+    state.complete(first_stage, {"valid": True})
+    state.start(retry_stage, {})
+    state.fail(retry_stage, "RETRY_ME", "prepare canonical resume")
+    state.retry_from(retry_stage)
+    with session_scope(database_url) as session:
+        session.get(GenerationJob, job_id).status = resume_status
+        session.query(JobStage).filter_by(
+            job_id=job_id,
+            stage=first_stage,
+        ).one().output_json = ["corrupt"]
+    runtime = RecordingRuntime()
+
+    result = await PipelineOrchestrator(database_url, runtime).run(job_id)
+
+    job, stages = persisted(database_url, job_id)
+    assert runtime.calls == []
+    assert result.status == job.status == JobStatus.FAILED
+    assert job.current_stage == first_stage.value
+    assert job.error_code == "INVALID_STAGE_OUTPUT"
+    assert stages[first_stage].status == StageStatus.COMPLETED
+    assert stages[first_stage].error_code == "INVALID_STAGE_OUTPUT"
+    assert stages[retry_stage].status == StageStatus.PENDING
 
 
 @pytest.mark.asyncio
@@ -453,6 +520,11 @@ async def test_invalid_runtime_output_fails_current_stage_without_corruption(
     assert job.error_code == "RUNTIME_ERROR"
     assert job.error_message == message
     assert stages[first_stage].status == StageStatus.FAILED
+    assert stages[first_stage].error_code == "RUNTIME_ERROR"
+    assert stages[first_stage].error_message == message
     assert stages[first_stage].output_json is None
+    assert all(
+        stages[stage].status == StageStatus.PENDING
+        for stage in PIPELINE_STAGES[1:]
+    )
     assert len(runtime.calls) == 1
-    json.dumps(job.error_message)
