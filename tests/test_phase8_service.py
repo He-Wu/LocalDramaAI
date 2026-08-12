@@ -712,6 +712,7 @@ def test_canonical_probe_rejects_wrong_audio_sample_rate():
         video=VideoStreamInfo("h264", "yuv420p", 640, 368, 25.0, 10, 0.4),
         audio=AudioStreamInfo("aac", 48000, 1, 0.4),
         duration=0.4,
+        format_name="mov,mp4,m4a,3gp,3g2,mj2",
     )
 
     with pytest.raises(RuntimeError, match="locked A/V profile"):
