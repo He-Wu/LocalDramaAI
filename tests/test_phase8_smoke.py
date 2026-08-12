@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import subprocess
@@ -401,15 +402,230 @@ def test_stop_process_tree_cleans_captured_descendant_after_parent_exits(monkeyp
 
     child = Child()
     monkeypatch.setattr(smoke_phase8.psutil, "Process", lambda pid: child)
+    waits = iter([([], [child]), ([child], [])])
+    monkeypatch.setattr(
+        smoke_phase8.psutil,
+        "wait_procs",
+        lambda processes, timeout: next(waits),
+    )
+
+    smoke_phase8.stop_process_tree(Parent(), {(202, 12.5)})
+
+    assert events == ["child-terminate", "child-kill"]
+
+
+def test_stop_process_tree_raises_when_owned_descendant_survives(monkeypatch):
+    from scripts import smoke_phase8
+
+    class Parent:
+        pid = 101
+
+        def poll(self):
+            return 1
+
+    class Child:
+        pid = 202
+
+        def create_time(self):
+            return 12.5
+
+        def is_running(self):
+            return True
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+    child = Child()
+    monkeypatch.setattr(smoke_phase8.psutil, "Process", lambda pid: child)
     monkeypatch.setattr(
         smoke_phase8.psutil,
         "wait_procs",
         lambda processes, timeout: ([], processes),
     )
 
-    smoke_phase8.stop_process_tree(Parent(), {(202, 12.5)})
+    with pytest.raises(RuntimeError, match=r"owned MuseTalk descendants.*202"):
+        smoke_phase8.stop_process_tree(Parent(), {(202, 12.5)})
 
-    assert events == ["child-terminate", "child-kill"]
+
+def test_stop_process_tree_raises_when_survivor_identity_cannot_be_verified(monkeypatch):
+    from scripts import smoke_phase8
+
+    class Parent:
+        pid = 101
+
+        def poll(self):
+            return 1
+
+    class Child:
+        pid = 202
+
+        def create_time(self):
+            return 12.5
+
+        def is_running(self):
+            return True
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+    child = Child()
+    lookups = iter([child, smoke_phase8.psutil.AccessDenied(pid=202)])
+
+    def lookup_process(pid):
+        candidate = next(lookups)
+        if isinstance(candidate, BaseException):
+            raise candidate
+        return candidate
+
+    monkeypatch.setattr(smoke_phase8.psutil, "Process", lookup_process)
+    monkeypatch.setattr(
+        smoke_phase8.psutil,
+        "wait_procs",
+        lambda processes, timeout: ([], processes),
+    )
+
+    with pytest.raises(RuntimeError, match=r"verify owned descendant PID 202"):
+        smoke_phase8.stop_process_tree(Parent(), {(202, 12.5)})
+
+
+def test_stop_process_tree_keeps_all_captured_identities_for_reused_pid(monkeypatch):
+    from scripts import smoke_phase8
+
+    events = []
+
+    class Parent:
+        pid = 101
+
+        def poll(self):
+            return 1
+
+    class Child:
+        pid = 202
+
+        def create_time(self):
+            return 12.5
+
+        def is_running(self):
+            return True
+
+        def terminate(self):
+            events.append("terminate")
+
+        def kill(self):
+            pytest.fail("graceful termination should be enough")
+
+    child = Child()
+    monkeypatch.setattr(smoke_phase8.psutil, "Process", lambda pid: child)
+    monkeypatch.setattr(
+        smoke_phase8.psutil,
+        "wait_procs",
+        lambda processes, timeout: (processes, []),
+    )
+
+    smoke_phase8.stop_process_tree(Parent(), {(202, 12.5), (202, 13.5)})
+
+    assert events == ["terminate"]
+
+
+def test_run_smoke_preserves_primary_error_and_attaches_cleanup_failures(monkeypatch, tmp_path):
+    from scripts import smoke_phase8
+
+    class FailingLog:
+        def close(self):
+            raise OSError("log close failed")
+
+    async def monitor(stop, samples, *, started):
+        await stop.wait()
+
+    async def ports_free():
+        return None
+
+    monkeypatch.setattr(smoke_phase8, "attest_musetalk_runtime", lambda *args: {"repo_commit": "abc"})
+    monkeypatch.setattr(smoke_phase8, "assert_ports_free", lambda: None)
+    monkeypatch.setattr(smoke_phase8, "seed_phase8_database", lambda path: object())
+    monkeypatch.setattr(smoke_phase8.Path, "open", lambda *args, **kwargs: FailingLog())
+    monkeypatch.setattr(smoke_phase8, "monitor_resources", monitor)
+    monkeypatch.setattr(
+        smoke_phase8,
+        "_start_service",
+        lambda *args: (_ for _ in ()).throw(ValueError("generation failed")),
+    )
+    monkeypatch.setattr(
+        smoke_phase8,
+        "stop_process_tree",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("process cleanup failed")),
+    )
+    monkeypatch.setattr(smoke_phase8, "wait_ports_free", ports_free)
+
+    args = smoke_phase8.argparse.Namespace(
+        musetalk_url="http://127.0.0.1:8030",
+        evidence_root=str(tmp_path),
+        run_id="cleanup-test",
+        musetalk_repo=str(tmp_path / "MuseTalk"),
+        repo_commit="abc",
+        model_lock=str(tmp_path / "models.lock.json"),
+        service_python=str(tmp_path / "python.exe"),
+        ffmpeg_bin=str(tmp_path),
+        generation_timeout=1.0,
+    )
+
+    with pytest.raises(ValueError, match="generation failed") as captured:
+        asyncio.run(smoke_phase8.run_smoke(args))
+
+    notes = getattr(captured.value, "__notes__", [])
+    assert any("process cleanup failed" in note for note in notes)
+    assert any("log close failed" in note for note in notes)
+
+
+def test_stop_process_tree_still_cleans_descendants_when_parent_wait_fails(monkeypatch):
+    from scripts import smoke_phase8
+
+    events = []
+
+    class Parent:
+        pid = 101
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout):
+            raise OSError("parent wait failed")
+
+    class Child:
+        pid = 202
+
+        def create_time(self):
+            return 12.5
+
+        def is_running(self):
+            return True
+
+        def terminate(self):
+            events.append("child-terminate")
+
+    child = Child()
+    monkeypatch.setattr(
+        smoke_phase8.subprocess,
+        "run",
+        lambda *args, **kwargs: smoke_phase8.subprocess.CompletedProcess(args[0], 0),
+    )
+    monkeypatch.setattr(smoke_phase8.psutil, "Process", lambda pid: child)
+    monkeypatch.setattr(
+        smoke_phase8.psutil,
+        "wait_procs",
+        lambda processes, timeout: (processes, []),
+    )
+
+    with pytest.raises(RuntimeError, match="parent wait failed"):
+        smoke_phase8.stop_process_tree(Parent(), {(202, 12.5)})
+
+    assert events == ["child-terminate"]
 
 
 @pytest.mark.parametrize(

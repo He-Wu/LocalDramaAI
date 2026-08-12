@@ -1002,6 +1002,7 @@ def stop_process_tree(
     captured_descendants: Iterable[tuple[int, float]] = (),
 ) -> None:
     """Stop only the launched parent and descendants proven to have belonged to it."""
+    cleanup_errors: list[str] = []
     parent_alive = process is not None and process.poll() is None
     if parent_alive and process is not None:
         if os.name == "nt":
@@ -1018,36 +1019,93 @@ def stop_process_tree(
             except (OSError, subprocess.TimeoutExpired):
                 taskkill_failed = True
             if taskkill_failed and process.poll() is None:
-                process.terminate()
+                try:
+                    process.terminate()
+                except (OSError, subprocess.SubprocessError) as exc:
+                    cleanup_errors.append(f"terminate parent PID {process.pid}: {exc}")
         else:
-            process.terminate()
+            try:
+                process.terminate()
+            except (OSError, subprocess.SubprocessError) as exc:
+                cleanup_errors.append(f"terminate parent PID {process.pid}: {exc}")
         try:
             process.wait(timeout=30)
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=10)
+            try:
+                process.kill()
+                process.wait(timeout=10)
+            except (OSError, subprocess.SubprocessError) as exc:
+                cleanup_errors.append(f"kill parent PID {process.pid}: {exc}")
+        except (OSError, subprocess.SubprocessError) as exc:
+            cleanup_errors.append(f"wait for parent PID {process.pid}: {exc}")
+        try:
+            if process.poll() is None:
+                cleanup_errors.append(f"owned MuseTalk parent still alive: {process.pid}")
+        except (OSError, subprocess.SubprocessError) as exc:
+            cleanup_errors.append(f"verify parent PID {process.pid}: {exc}")
 
     owned: list[psutil.Process] = []
+    captured_create_times: dict[int, set[float]] = {}
     for pid, create_time in set(captured_descendants):
+        captured_create_times.setdefault(pid, set()).add(create_time)
+    owned_create_times: dict[int, float] = {}
+    for pid, create_times in captured_create_times.items():
         try:
             candidate = psutil.Process(pid)
-            if abs(candidate.create_time() - create_time) <= 1e-6 and candidate.is_running():
+            candidate_create_time = candidate.create_time()
+            if (
+                any(abs(candidate_create_time - value) <= 1e-6 for value in create_times)
+                and candidate.is_running()
+            ):
                 owned.append(candidate)
-        except (psutil.Error, OSError):
+                owned_create_times[pid] = candidate_create_time
+        except psutil.NoSuchProcess:
             continue
+        except (psutil.Error, OSError) as exc:
+            cleanup_errors.append(f"inspect owned descendant PID {pid}: {exc}")
     for descendant in owned:
         try:
             descendant.terminate()
-        except (psutil.Error, OSError):
-            continue
-    _, alive = psutil.wait_procs(owned, timeout=5)
+        except (psutil.Error, OSError) as exc:
+            cleanup_errors.append(f"terminate PID {descendant.pid}: {exc}")
+    try:
+        _, alive = psutil.wait_procs(owned, timeout=5)
+    except (psutil.Error, OSError) as exc:
+        cleanup_errors.append(f"wait for owned descendants: {exc}")
+        alive = owned
     for descendant in alive:
         try:
             descendant.kill()
-        except (psutil.Error, OSError):
-            continue
+        except (psutil.Error, OSError) as exc:
+            cleanup_errors.append(f"kill PID {descendant.pid}: {exc}")
     if alive:
-        psutil.wait_procs(alive, timeout=5)
+        try:
+            _, alive = psutil.wait_procs(alive, timeout=5)
+        except (psutil.Error, OSError) as exc:
+            cleanup_errors.append(f"final wait for owned descendants: {exc}")
+
+    survivors: list[int] = []
+    for descendant in alive:
+        try:
+            candidate = psutil.Process(descendant.pid)
+            if (
+                abs(candidate.create_time() - owned_create_times[descendant.pid]) <= 1e-6
+                and candidate.is_running()
+            ):
+                survivors.append(descendant.pid)
+        except psutil.NoSuchProcess:
+            continue
+        except (psutil.Error, OSError, KeyError) as exc:
+            cleanup_errors.append(
+                f"verify owned descendant PID {descendant.pid}: {exc}"
+            )
+    if survivors:
+        cleanup_errors.append(
+            "owned MuseTalk descendants still alive: "
+            + ", ".join(str(pid) for pid in sorted(set(survivors)))
+        )
+    if cleanup_errors:
+        raise RuntimeError("; ".join(cleanup_errors))
 
 
 async def _wait_for_health(provider: MuseTalkProvider, timeout: float = 180.0) -> dict[str, Any]:
@@ -1205,8 +1263,14 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 )
             except Exception as exc:
                 cleanup_errors.append(exc)
-        stop_process_tree(service_process, owned_descendants)
-        log_handle.close()
+        try:
+            stop_process_tree(service_process, owned_descendants)
+        except Exception as exc:
+            cleanup_errors.append(exc)
+        try:
+            log_handle.close()
+        except Exception as exc:
+            cleanup_errors.append(exc)
         try:
             await wait_ports_free()
             assert_ports_free()
