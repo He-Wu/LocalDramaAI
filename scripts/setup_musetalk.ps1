@@ -23,6 +23,7 @@ $pythonInstaller = Join-Path $env:TEMP 'python-3.10.11-amd64.exe'
 $pythonInstallerUrl = 'https://www.python.org/ftp/python/3.10.11/python-3.10.11-amd64.exe'
 $pythonInstallerSha256 = 'D8DEDE5005564B408BA50317108B765ED9C3C510342A598F9FD42681CBE0648B'
 $officialRepository = 'https://github.com/TMElyralab/MuseTalk.git'
+$officialConstraints = Join-Path $PSScriptRoot 'musetalk-requirements.constraints.txt'
 
 function Invoke-NativeChecked {
     param(
@@ -78,8 +79,8 @@ if (-not (Test-Path -LiteralPath $python)) {
     throw "Dedicated Python executable was not created: $python"
 }
 $pythonVersion = (& $python -c 'import platform; print(platform.python_version())').Trim()
-if ($LASTEXITCODE -ne 0 -or -not $pythonVersion.StartsWith('3.10.')) {
-    throw "MuseTalk requires dedicated Python 3.10, found '$pythonVersion' at $python"
+if ($LASTEXITCODE -ne 0 -or $pythonVersion -ne '3.10.11') {
+    throw "MuseTalk requires dedicated Python 3.10.11, found '$pythonVersion' at $python"
 }
 
 if (Test-Path -LiteralPath (Join-Path $repository '.git')) {
@@ -110,8 +111,11 @@ if (-not (Test-Path -LiteralPath $environmentPython)) {
     Invoke-NativeChecked -FilePath $python -Arguments @('-m', 'venv', $environment)
 }
 $environmentVersion = (& $environmentPython -c 'import platform; print(platform.python_version())').Trim()
-if ($LASTEXITCODE -ne 0 -or -not $environmentVersion.StartsWith('3.10.')) {
-    throw "The existing env-musetalk is not Python 3.10: $environmentVersion"
+if ($LASTEXITCODE -ne 0 -or $environmentVersion -ne '3.10.11') {
+    throw "The existing env-musetalk is not Python 3.10.11: $environmentVersion"
+}
+if (-not (Test-Path -LiteralPath $officialConstraints -PathType Leaf)) {
+    throw "MuseTalk constraints file is missing: $officialConstraints"
 }
 
 Invoke-NativeChecked -FilePath $environmentPython -Arguments @('-m', 'pip', 'install', '--upgrade', 'pip==24.3.1', 'setuptools==75.6.0', 'wheel==0.45.1')
@@ -120,14 +124,18 @@ Invoke-NativeChecked -FilePath $environmentPython -Arguments @(
     'torch==2.0.1', 'torchvision==0.15.2', 'torchaudio==2.0.2',
     '--index-url', 'https://download.pytorch.org/whl/cu118'
 )
-Invoke-NativeChecked -FilePath $environmentPython -Arguments @('-m', 'pip', 'install', '-r', (Join-Path $repository 'requirements.txt'))
-Invoke-NativeChecked -FilePath $environmentPython -Arguments @('-m', 'pip', 'install', '--no-cache-dir', '--upgrade', 'openmim')
+Invoke-NativeChecked -FilePath $environmentPython -Arguments @(
+    '-m', 'pip', 'install',
+    '-r', (Join-Path $repository 'requirements.txt'),
+    '-c', $officialConstraints
+)
+Invoke-NativeChecked -FilePath $environmentPython -Arguments @('-m', 'pip', 'install', '--no-cache-dir', 'openmim==0.3.9')
 
 $mim = Join-Path $environment 'Scripts\mim.exe'
 if (-not (Test-Path -LiteralPath $mim)) {
     throw "OpenMIM executable is missing after installation: $mim"
 }
-Invoke-NativeChecked -FilePath $mim -Arguments @('install', 'mmengine')
+Invoke-NativeChecked -FilePath $mim -Arguments @('install', 'mmengine==0.10.7')
 Invoke-NativeChecked -FilePath $mim -Arguments @('install', 'mmcv==2.0.1')
 Invoke-NativeChecked -FilePath $mim -Arguments @('install', 'mmdet==3.1.0')
 Invoke-NativeChecked -FilePath $mim -Arguments @('install', 'mmpose==1.1.0')
@@ -140,7 +148,7 @@ Invoke-NativeChecked -FilePath $environmentPython -Arguments @('-m', 'pip', 'ins
 Invoke-NativeChecked -FilePath $environmentPython -Arguments @('-m', 'pip', 'check')
 Invoke-NativeChecked -FilePath $environmentPython -Arguments @(
     '-c',
-    "import torch, torchvision, torchaudio; assert torch.__version__.startswith('2.0.1'); assert torchvision.__version__.startswith('0.15.2'); assert torchaudio.__version__.startswith('2.0.2'); assert torch.cuda.is_available(); print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0))"
+    "from importlib.metadata import version; import torch; expected=('torch==2.0.1+cu118','torchvision==0.15.2+cu118','torchaudio==2.0.2+cu118','openmim==0.3.9','mmcv==2.0.1','mmdet==3.1.0','mmengine==0.10.7','mmpose==1.1.0'); actual=tuple(f'{name}=={version(name)}' for name in ('torch','torchvision','torchaudio','openmim','mmcv','mmdet','mmengine','mmpose')); assert actual == expected, f'package version mismatch: expected {expected}, got {actual}'; assert torch.version.cuda == '11.8'; assert torch.cuda.is_available(); print(*actual, 'cuda='+str(torch.version.cuda), 'gpu='+torch.cuda.get_device_name(0))"
 )
 Invoke-NativeChecked -FilePath $environmentPython -Arguments @(
     '-c',

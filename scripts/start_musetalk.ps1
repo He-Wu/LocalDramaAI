@@ -14,6 +14,8 @@ if (-not $ProjectRoot) {
 $ProjectRoot = [System.IO.Path]::GetFullPath($ProjectRoot)
 $python = Join-Path $Root 'env-musetalk\Scripts\python.exe'
 $repository = Join-Path $Root 'MuseTalk'
+$jobRoot = Join-Path $Root 'musetalk-jobs'
+$jobRoot = [System.IO.Path]::GetFullPath($jobRoot)
 $runDirectory = Join-Path $Root 'run'
 $pidFile = Join-Path $runDirectory 'musetalk-service.pid'
 $healthUrl = 'http://127.0.0.1:8030/health'
@@ -26,6 +28,9 @@ if (-not (Test-Path -LiteralPath (Join-Path $repository '.git'))) {
 }
 if (-not (Test-Path -LiteralPath (Join-Path $ProjectRoot 'ai_services\musetalk\service.py'))) {
     throw "LocalDramaAI MuseTalk service module is missing under $ProjectRoot"
+}
+if ($jobRoot -notmatch '^[A-Za-z]:[\\/](?:[A-Za-z0-9_.-]+(?:[\\/]|$))+$') {
+    throw "MuseTalk job root must be an absolute shell-safe ASCII path: $jobRoot"
 }
 $listener = Get-NetTCPConnection -State Listen -LocalPort 8030 -ErrorAction SilentlyContinue
 if ($listener) {
@@ -43,6 +48,7 @@ $env:LOCALDRAMA_MUSETALK_REPO = $repository
 $env:LOCALDRAMA_MUSETALK_PYTHON = $python
 $env:LOCALDRAMA_MUSETALK_FFMPEG_BIN = $ffmpegBin
 $env:LOCALDRAMA_MUSETALK_REPO_COMMIT = $resolvedCommit
+$env:LOCALDRAMA_MUSETALK_JOB_ROOT = $jobRoot
 New-Item -ItemType Directory -Path $runDirectory -Force | Out-Null
 
 $arguments = @(
@@ -66,7 +72,7 @@ try {
         }
         try {
             $health = Invoke-RestMethod -Uri $healthUrl -Method Get -TimeoutSec 5
-            if ($health.status -in @('ok', 'ready')) {
+            if ($health.status -eq 'ONLINE' -and $health.ready -eq $true) {
                 Write-Host "MuseTalk service ready on http://127.0.0.1:8030 (PID $($process.Id))"
                 return
             }

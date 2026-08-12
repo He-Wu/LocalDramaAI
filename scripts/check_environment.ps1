@@ -42,46 +42,27 @@ if ($LASTEXITCODE -ne 0 -or $commit -ne $ExpectedMuseTalkCommit) {
     throw "MuseTalk commit mismatch: expected $ExpectedMuseTalkCommit, got $commit"
 }
 $pythonVersion = (& $python -c 'import platform; print(platform.python_version())').Trim()
-if ($LASTEXITCODE -ne 0 -or -not $pythonVersion.StartsWith('3.10.')) {
-    throw "env-musetalk must use Python 3.10, got $pythonVersion"
+if ($LASTEXITCODE -ne 0 -or $pythonVersion -ne '3.10.11') {
+    throw "env-musetalk must use Python 3.10.11, got $pythonVersion"
 }
 Invoke-NativeChecked -FilePath $python -Arguments @(
     '-c',
-    "import torch; assert torch.__version__.startswith('2.0.1'); assert torch.cuda.is_available(); print('torch.__version__=' + torch.__version__); print('cuda=' + str(torch.version.cuda)); print('gpu=' + torch.cuda.get_device_name(0))"
+    "from importlib.metadata import version; import torch; expected=('torch==2.0.1+cu118','torchvision==0.15.2+cu118','torchaudio==2.0.2+cu118','openmim==0.3.9','mmcv==2.0.1','mmdet==3.1.0','mmengine==0.10.7','mmpose==1.1.0'); actual=tuple(f'{name}=={version(name)}' for name in ('torch','torchvision','torchaudio','openmim','mmcv','mmdet','mmengine','mmpose')); assert actual == expected, f'package version mismatch: expected {expected}, got {actual}'; assert torch.version.cuda == '11.8'; assert torch.cuda.is_available(); print(*actual, 'cuda='+str(torch.version.cuda), 'gpu='+torch.cuda.get_device_name(0))"
 )
 Invoke-NativeChecked -FilePath $python -Arguments @(
     '-c',
     'import cv2, diffusers, mmcv, mmdet, mmengine, mmpose, omegaconf, transformers; print("MuseTalk imports OK")'
 )
 
-$requiredModels = @(
-    'models\musetalkV15\musetalk.json',
-    'models\musetalkV15\unet.pth',
-    'models\sd-vae\config.json',
-    'models\sd-vae\diffusion_pytorch_model.bin',
-    'models\whisper\config.json',
-    'models\whisper\pytorch_model.bin',
-    'models\whisper\preprocessor_config.json',
-    'models\dwpose\dw-ll_ucoco_384.pth',
-    'models\syncnet\latentsync_syncnet.pt',
-    'models\face-parse-bisent\79999_iter.pth',
-    'models\face-parse-bisent\resnet18-5c106cde.pth'
-)
-foreach ($relativePath in $requiredModels) {
-    Assert-File -Path (Join-Path $repository $relativePath)
-}
-
 $hashManifest = Join-Path $repository 'models\model-hashes.json'
 Assert-File -Path $hashManifest
-$hashRecords = Get-Content -LiteralPath $hashManifest -Raw | ConvertFrom-Json
-foreach ($record in $hashRecords) {
-    $modelPath = Join-Path $repository $record.path
-    Assert-File -Path $modelPath
-    $actualHash = (Get-FileHash -LiteralPath $modelPath -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($actualHash -ne $record.sha256) {
-        throw "Model SHA256 mismatch for $modelPath"
-    }
-}
+$modelLockPath = Join-Path $PSScriptRoot 'musetalk-models.lock.json'
+$modelVerifierPath = Join-Path $PSScriptRoot 'musetalk_model_verification.ps1'
+Assert-File -Path $modelLockPath
+Assert-File -Path $modelVerifierPath
+$expectedModels = @(Get-Content -LiteralPath $modelLockPath -Raw | ConvertFrom-Json)
+. $modelVerifierPath
+Assert-MuseTalkModelFiles -Repository $repository -ManifestPath $hashManifest -ExpectedModels $expectedModels
 
 Invoke-NativeChecked -FilePath 'git' -Arguments @('--version')
 Invoke-NativeChecked -FilePath 'ffmpeg' -Arguments @('-version')

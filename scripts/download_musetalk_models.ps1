@@ -86,6 +86,47 @@ $downloads = @(
     }
 )
 
+$modelLockPath = Join-Path $PSScriptRoot 'musetalk-models.lock.json'
+if (-not (Test-Path -LiteralPath $modelLockPath -PathType Leaf)) {
+    throw "Authoritative MuseTalk model lock is missing: $modelLockPath"
+}
+$lockedModels = @(Get-Content -LiteralPath $modelLockPath -Raw | ConvertFrom-Json)
+$downloadDefinitions = @()
+foreach ($download in $downloads) {
+    for ($index = 0; $index -lt $download.Include.Count; $index++) {
+        $downloadDefinitions += [pscustomobject]@{
+            repository = [string]$download.Repository
+            revision = [string]$download.Revision
+            source = [string]$download.Include[$index]
+            path = 'models/' + ([string]$download.Expected[$index]).Replace('\', '/')
+            bytes = [long]$download.ExpectedBytes[$index]
+            sha256 = [string]$download.ExpectedSha256[$index]
+        }
+    }
+}
+if ($lockedModels.Count -ne $downloadDefinitions.Count) {
+    throw 'Download definition differs from the authoritative model lock: record count mismatch'
+}
+$lockByPath = @{}
+foreach ($lockedModel in $lockedModels) {
+    $lockedPath = [string]$lockedModel.path
+    if (-not $lockedPath -or $lockByPath.ContainsKey($lockedPath)) {
+        throw "Download definition differs from the authoritative model lock: missing or duplicate path $lockedPath"
+    }
+    $lockByPath[$lockedPath] = $lockedModel
+}
+foreach ($definition in $downloadDefinitions) {
+    $lockedModel = $lockByPath[[string]$definition.path]
+    if ($null -eq $lockedModel -or
+        [string]$definition.repository -ne [string]$lockedModel.repository -or
+        [string]$definition.revision -ne [string]$lockedModel.revision -or
+        [string]$definition.source -ne [string]$lockedModel.source -or
+        [long]$definition.bytes -ne [long]$lockedModel.bytes -or
+        [string]$definition.sha256 -ne [string]$lockedModel.sha256) {
+        throw "Download definition differs from the authoritative model lock: $($definition.path)"
+    }
+}
+
 New-Item -ItemType Directory -Path $models -Force | Out-Null
 $manifest = Join-Path $models 'model-hashes.json'
 $verifiedRecords = @{}
