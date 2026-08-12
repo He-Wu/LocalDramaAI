@@ -32,9 +32,35 @@ qwen3_tts:
   accelerate: "1.12.0"
   launch_args: "-m uvicorn ai_services.qwen3_tts.service:app --host 127.0.0.1 --port 8020"
 musetalk:
-  repository: null
-  commit_or_release: null
-  model_version: null
+  repository: "https://github.com/TMElyralab/MuseTalk.git"
+  path: "E:/LocalDramaAI/MuseTalk"
+  commit_or_release: "0a89dec45a0192b824e3cf4daf96c239440c5ed8"
+  model_version: "1.5"
+  python: "3.10.11"
+  python_executable: "E:/LocalDramaAI/env-musetalk/Scripts/python.exe"
+  torch: "2.0.1+cu118"
+  torchvision: "0.15.2+cu118"
+  torchaudio: "2.0.2+cu118"
+  cuda_runtime: "11.8"
+  mmcv: "2.0.1"
+  mmdet: "3.1.0"
+  mmengine: "0.10.7"
+  mmpose: "1.1.0"
+  diffusers: "0.30.2"
+  transformers: "4.39.2"
+  opencv: "4.9.0"
+  service_dependencies:
+    fastapi: "0.133.1"
+    pydantic: "2.11.10"
+    pyyaml: "6.0.3"
+    rich: "13.4.2"
+    typer: "0.15.4"
+    uvicorn: "0.41.0"
+  model_hash_manifest: "E:/LocalDramaAI/MuseTalk/models/model-hashes.json"
+  model_hash_manifest_sha256: "f6706e3e0084d1eb05b11b0c38efa874f1eb98545f8d8413668a6c82b4219159"
+  service_launch_args: "-m uvicorn ai_services.musetalk.service:app --app-dir <project-root> --host 127.0.0.1 --port 8030 --no-access-log"
+  inference_launch_args: "-m scripts.inference --inference_config <job>/task.yaml --result_dir <job>/results --unet_model_path models/musetalkV15/unet.pth --unet_config models/musetalkV15/musetalk.json --version v15 --use_float16 --batch_size 4 --extra_margin 10 --parsing_mode jaw --left_cheek_width 90 --right_cheek_width 90 --ffmpeg_path <ffmpeg-bin>"
+  output_profile: "640x368, 70 frames, 25 fps, H.264/yuv420p, AAC mono 16 kHz"
 ffmpeg:
   version: "8.1"
 wan_video:
@@ -47,7 +73,7 @@ wan_video:
   text_encoder_sha256: "c3355d30191f1f066b26d93fba017ae9809dce6c627dda5f6a66eaa651204f68"
   profile: "640x368, 49 frames, 16 fps"
 verification:
-  phase: "7"
+  phase: "8"
   comfyui_verified: true
   phase3_image: "E:/LocalDramaAI/Storage/phase3/phase3_smoke_00002_.png"
   phase4_master: "E:/LocalDramaAI/Storage/phase4/1786252381/characters/master_00001_.png"
@@ -64,3 +90,14 @@ verification:
   phase7_video: "E:/kang/github/Movie/artifacts/phase7/1786342910/video/0753ed98-8ccc-4c4c-99dc-f9fc96b822ac_00001_.mp4"
   phase7_video_sha256: "009cf772e2ba8f36604cc7f72c6799c15f093699aecb51c8cbea89f1db9a95f6"
   phase7_database: "E:/kang/github/Movie/.runtime/phase7/phase7-smoke-1786342910.db"
+  phase8_lipsync: "E:/kang/github/Movie/artifacts/phase8/20260812-203657-29f959d5/output/musetalk-b9a88f6a1b1a4428965b79a737da58b3.mp4"
+  phase8_lipsync_sha256: "73867115bff94ee05eadd31b5a2954eca4c0e1173ff30e95e9b55424d202ef27"
+  phase8_database: "E:/kang/github/Movie/.runtime/phase8/phase8-smoke-20260812-203657-29f959d5.db"
+  phase8_database_sha256: "315d5a428816bf90ce71273543031c5cf5841cea227a172d8bfd3565731c191c"
+  phase8_provider_manifest: "E:/kang/github/Movie/artifacts/phase8/20260812-203657-29f959d5/output/musetalk-b9a88f6a1b1a4428965b79a737da58b3.manifest.json"
+  phase8_provider_manifest_sha256: "7c90acc0710f4688eee35b38a73e0c5c60611c18b34668745669953d0b6bf940"
+  phase8_evidence: "E:/kang/github/Movie/artifacts/phase8/20260812-203657-29f959d5/evidence.json"
+  phase8_evidence_sha256: "a661e33eb1452ed110090dd86d7adb371c29cc965b5eccc06733c1db0190e912"
+  phase8_resources: "E:/kang/github/Movie/artifacts/phase8/20260812-203657-29f959d5/resources.json"
+  phase8_resources_sha256: "73b7124f4e32bada72a74b8188a322e67e89558af94c30156a213a1b207b4888"
+  phase8_visual_review: "approved"
