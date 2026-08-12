@@ -1,0 +1,7 @@
+fastapi==0.133.1
+# Compatible with MuseTalk's Gradio 5.24 and OpenMIM/OpenXLab dependency set.
+pydantic==2.11.10
+PyYAML==6.0.3
+rich==13.4.2
+typer==0.15.4
+uvicorn[standard]==0.41.0

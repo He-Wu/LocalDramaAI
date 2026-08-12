@@ -47,3 +47,13 @@ FlashAttention 2 is not installed on this Windows runtime, so the verified smoke
 Output: `E:\kang\github\Movie\artifacts\phase7\1786342910\video\0753ed98-8ccc-4c4c-99dc-f9fc96b822ac_00001_.mp4` (H.264, 3.0625 s, 72,039 bytes, SHA256 `009cf772e2ba8f36604cc7f72c6799c15f093699aecb51c8cbea89f1db9a95f6`). The source is the existing Phase 4 Storyboard Asset; it was copied into ComfyUI input rather than regenerated. The MP4 is 0.2825 seconds longer than the required Shot duration and 0.5825 seconds longer than the synthesized Dialogue, so the duration contract is satisfied. Database inspection confirms `Shot.video_asset_id`, VIDEO Asset, GenerationManifest input assets, and `VIDEO_GENERATED` status agree.
 
 The complete smoke peaked close to the 32 GB physical-RAM limit and used a 52.2 GB Windows commit charge while Wan offloading was active. Closing unrelated applications remains important. Contact-sheet review shows stable face, hair, hand placement, and a natural blink; precise speech mouth shapes are intentionally deferred to PHASE 8 MuseTalk.
+
+## Phase 8 MuseTalk lip-sync smoke (2026-08-12)
+
+| Pipeline | Output profile | Service generation | End-to-end elapsed | Peak VRAM | Peak RAM | Peak Windows commit | Peak GPU / temperature | Result |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| Official MuseTalk 1.5, FP16, batch 4 | 640x368, 70 frames, 25 FPS, H.264/yuv420p + AAC mono 16 kHz | 35.8198 s | 39.139 s | 9,199 MiB | 23,548 MiB | 34,272 MiB | 97% / 75 C | Success |
+
+Output: `E:\kang\github\Movie\artifacts\phase8\20260812-205621-fad213b5\output\musetalk-e0eac769dadc4242ae8b6ac2f9ea55ab.mp4` (video 2.80 s, audio 2.78 s, A/V end delta 20 ms, SHA256 `58029ed0c9f539daed13faf643fba3c03f0c93e23d2814bfd36a44c144d09f98`). Full FFmpeg decode and database/provider-manifest link validation passed; ports 8020, 8030, and 8188 were free after verification.
+
+Start/middle/end frames and the mouth contact sheet were visually approved: mouth shapes vary plausibly without a visible jaw/hand seam, mask edge, mouth tearing, severe flicker, or identity change. The Wan source is slightly soft, so the output is an accepted lip-sync baseline rather than a final-quality render. Phase 8 does not generate subtitles or a final timeline.

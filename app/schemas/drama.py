@@ -18,6 +18,8 @@ class ShotSpec(BaseModel):
     description: str
     shot_type: str = "ACTION"
     duration: float = Field(default=3.0, ge=0.1)
+    requires_lip_sync: bool = False
+    speaker_visible: bool = False
     camera_angle: str = "平视"
     camera_movement: str = "固定"
     image_prompt: str = ""

@@ -1,0 +1,9 @@
+# Exact versions selected from the verified Windows/CUDA 11.8 environment for
+# direct requirements that the official MuseTalk commit leaves unpinned.
+gdown==6.1.0
+requests==2.28.2
+imageio==2.37.4
+imageio-ffmpeg==0.6.0
+omegaconf==2.3.1
+ffmpeg-python==0.2.0
+moviepy==1.0.3
