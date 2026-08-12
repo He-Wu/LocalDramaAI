@@ -69,7 +69,9 @@ def _project_storage_root(
         or project_id.split(".", 1)[0].upper() in reserved
     ):
         raise ValueError("Phase 9 project ID must be one safe ASCII path segment")
-    projects_root = (Path(storage_root).resolve() / "projects").resolve()
+    projects_root = Path(storage_root).resolve() / "projects"
+    projects_root.mkdir(parents=True, exist_ok=True)
+    projects_root = projects_root.resolve()
     project_root = (projects_root / project_id).resolve()
     try:
         relative = project_root.relative_to(projects_root)

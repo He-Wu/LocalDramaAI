@@ -721,7 +721,10 @@ def test_two_concurrent_renders_commit_exactly_one_coherent_winner(
 
     winners = [outcome for outcome in outcomes if not isinstance(outcome, Exception)]
     losers = [outcome for outcome in outcomes if isinstance(outcome, Exception)]
-    assert len(winners) == len(losers) == 1
+    assert len(winners) == len(losers) == 1, [
+        (repr(outcome), repr(getattr(outcome, "__cause__", None)))
+        for outcome in outcomes
+    ]
     assert winners[0].alias_status == "READY"
     assert "timeline changed" in str(losers[0])
     with session_scope(seed_project.database) as session:
