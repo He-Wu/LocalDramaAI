@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import tempfile
@@ -5,11 +6,27 @@ from pathlib import Path
 
 
 class FFmpegProvider:
-    def __init__(self, executable: str = "ffmpeg"):
+    def __init__(self, executable: str = "ffmpeg", probe_executable: str = "ffprobe"):
         self.executable = executable
+        self.probe_executable = probe_executable
 
     def _run(self, args: list[str], timeout: int = 600) -> subprocess.CompletedProcess[str]:
-        result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        try:
+            result = subprocess.run(
+                args,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except subprocess.TimeoutExpired as error:
+            stderr = error.stderr or ""
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"FFmpeg timed out after {timeout} seconds: {stderr[-1200:]}"
+            ) from error
         if result.returncode != 0:
             stderr = result.stderr or ""
             raise RuntimeError(f"FFmpeg failed: {stderr[-1200:]}")
@@ -44,7 +61,7 @@ class FFmpegProvider:
         output_path = Path(output_path)
         temp = self._temporary_path(output_path)
         try:
-            args = [self.executable, "-y"]
+            args = [self.executable, "-nostdin", "-y"]
             if image_input:
                 args += ["-loop", "1"]
             args += ["-i", str(input_path)]
@@ -76,6 +93,7 @@ class FFmpegProvider:
             self._run(
                 [
                     self.executable,
+                    "-nostdin",
                     "-y",
                     "-i",
                     str(video_path),
@@ -89,6 +107,12 @@ class FFmpegProvider:
                     "copy",
                     "-c:a",
                     "aac",
+                    "-af",
+                    "apad",
+                    "-ar",
+                    "48000",
+                    "-ac",
+                    "2",
                     "-b:a",
                     "192k",
                     "-shortest",
@@ -112,6 +136,17 @@ class FFmpegProvider:
                 raise ValueError("concat input path cannot contain a newline")
             normalized_inputs.append(self._validated_input(input_path, "concat input"))
 
+        expected_signature = self._media_signature(normalized_inputs[0])
+        for input_path in normalized_inputs[1:]:
+            signature = self._media_signature(input_path)
+            for field, expected in expected_signature.items():
+                if signature[field] != expected:
+                    raise ValueError(
+                        "concat input profile mismatch for "
+                        f"{field}: expected {expected!r}, got {signature[field]!r} "
+                        f"in {input_path}"
+                    )
+
         output_path = Path(output_path)
         temp = self._temporary_path(output_path)
         manifest = None
@@ -122,6 +157,7 @@ class FFmpegProvider:
             self._run(
                 [
                     self.executable,
+                    "-nostdin",
                     "-y",
                     "-f",
                     "concat",
@@ -149,6 +185,45 @@ class FFmpegProvider:
         if not path.is_file() or path.stat().st_size <= 0:
             raise ValueError(f"{label} must exist and be nonempty: {path}")
         return path
+
+    def _media_signature(self, path: Path) -> dict[str, object]:
+        result = self._run(
+            [
+                self.probe_executable,
+                "-v",
+                "error",
+                "-show_streams",
+                "-of",
+                "json",
+                str(path),
+            ]
+        )
+        probe = json.loads(result.stdout)
+        video = next(
+            (stream for stream in probe.get("streams", []) if stream.get("codec_type") == "video"),
+            None,
+        )
+        audio = next(
+            (stream for stream in probe.get("streams", []) if stream.get("codec_type") == "audio"),
+            None,
+        )
+        if video is None:
+            raise ValueError(f"concat input requires a video stream: {path}")
+        if audio is None:
+            raise ValueError(f"concat input requires an audio stream: {path}")
+        return {
+            "video.codec": video.get("codec_name"),
+            "video.width": video.get("width"),
+            "video.height": video.get("height"),
+            "video.pixel_format": video.get("pix_fmt"),
+            "video.frame_rate": video.get("r_frame_rate"),
+            "video.time_base": video.get("time_base"),
+            "audio.codec": audio.get("codec_name"),
+            "audio.sample_rate": audio.get("sample_rate"),
+            "audio.channels": audio.get("channels"),
+            "audio.channel_layout": audio.get("channel_layout"),
+            "audio.time_base": audio.get("time_base"),
+        }
 
     @staticmethod
     def _quote_manifest_path(path: Path) -> str:
