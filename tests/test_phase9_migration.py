@@ -6,6 +6,7 @@ from alembic import command
 from alembic.config import Config
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
+import pytest
 from sqlalchemy import create_engine, event, inspect, text
 
 from app.db.session import create_schema, initialize_database, session_scope
@@ -137,6 +138,46 @@ def _run_phase9_revision_with_foreign_keys(database: Path, direction: str):
         engine.dispose()
 
 
+def _run_failed_batch_guard(database: Path, foreign_keys_enabled: bool):
+    engine = create_engine(f"sqlite:///{database.as_posix()}")
+
+    @event.listens_for(engine, "connect")
+    def configure_foreign_keys(dbapi_connection, _):
+        cursor = dbapi_connection.cursor()
+        cursor.execute(
+            f"PRAGMA foreign_keys={'ON' if foreign_keys_enabled else 'OFF'}"
+        )
+        cursor.close()
+
+    migration = importlib.import_module(
+        "migrations.versions.0002_phase9_project_outputs"
+    )
+    try:
+        with engine.connect() as connection:
+            context = MigrationContext.configure(connection)
+            with Operations.context(context):
+                with pytest.raises(RuntimeError, match="injected batch failure"):
+                    with migration._disable_sqlite_foreign_keys_for_batch_recreate():
+                        connection.execute(
+                            text(
+                                "INSERT INTO scenes (id, project_id, title) "
+                                "VALUES ('partial-scene', 'project-1', 'Partial')"
+                            )
+                        )
+                        raise RuntimeError("injected batch failure")
+            pragma_after_failure = connection.execute(
+                text("PRAGMA foreign_keys")
+            ).scalar_one()
+
+        with engine.connect() as connection:
+            persisted_rows = connection.execute(
+                text("SELECT id FROM scenes WHERE id = 'partial-scene'")
+            ).all()
+        return pragma_after_failure, persisted_rows
+    finally:
+        engine.dispose()
+
+
 def _assert_phase9_project_schema(database: Path) -> None:
     engine = create_engine(f"sqlite:///{database.as_posix()}")
     try:
@@ -234,6 +275,20 @@ def test_batch_recreate_preserves_dependent_rows_with_foreign_keys_enabled(tmp_p
     }
     assert _run_phase9_revision_with_foreign_keys(database, "upgrade") == expected_rows
     assert _run_phase9_revision_with_foreign_keys(database, "downgrade") == expected_rows
+
+
+@pytest.mark.parametrize("foreign_keys_enabled", [True, False])
+def test_failed_batch_guard_rolls_back_and_restores_foreign_key_setting(
+    tmp_path,
+    foreign_keys_enabled,
+):
+    database = tmp_path / f"failed-batch-{foreign_keys_enabled}.db"
+    _create_phase8_database(database)
+
+    pragma, persisted_rows = _run_failed_batch_guard(database, foreign_keys_enabled)
+
+    assert pragma == int(foreign_keys_enabled)
+    assert persisted_rows == []
 
 
 def test_initialize_database_is_idempotent_after_create_all(tmp_path):

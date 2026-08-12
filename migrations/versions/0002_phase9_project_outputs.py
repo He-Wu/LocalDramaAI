@@ -48,7 +48,23 @@ def _disable_sqlite_foreign_keys_for_batch_recreate() -> Iterator[None]:
     bind.exec_driver_sql("PRAGMA foreign_keys=OFF")
     try:
         yield
-    finally:
+    except BaseException as migration_error:
+        try:
+            bind.rollback()
+        except BaseException as cleanup_error:
+            migration_error.add_note(
+                f"SQLite migration rollback also failed: {cleanup_error!r}"
+            )
+        try:
+            bind.exec_driver_sql("PRAGMA foreign_keys=ON")
+            bind.commit()
+        except BaseException as cleanup_error:
+            migration_error.add_note(
+                "Restoring SQLite foreign-key enforcement also failed: "
+                f"{cleanup_error!r}"
+            )
+        raise
+    else:
         bind.commit()
         bind.exec_driver_sql("PRAGMA foreign_keys=ON")
         bind.commit()
