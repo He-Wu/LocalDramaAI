@@ -4,6 +4,7 @@ class CharacterSpec(BaseModel):
     name: str
     age: str = "成年"
     gender: str = "未知"
+    appearance: str = ""  # Deprecated compatibility input; prefer granular fields.
     face: str = "自然脸型"
     eyes: str = "自然眼型"
     nose: str = ""

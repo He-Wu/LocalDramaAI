@@ -33,9 +33,14 @@ async def test_ollama_provider_parses_structured_drama_and_unloads():
     system_prompt = calls[0][1]["messages"][0]["content"]
     assert "shots.scene_order" in system_prompt
     assert "shots.character_name" in system_prompt
-    assert all(field in system_prompt for field in (
-        "age", "gender", "face", "eyes", "hair", "body", "clothes", "visual_style",
-    ))
+    required_character_fields = (
+        "name", "age", "gender", "face", "eyes", "nose", "mouth", "hair", "body",
+        "clothes", "accessories", "visual_style", "personality",
+    )
+    assert (
+        f"每个 character 必须给出 {'、'.join(required_character_fields)}"
+        in system_prompt
+    )
 
 @pytest.mark.anyio
 async def test_ollama_provider_retries_truncated_json():

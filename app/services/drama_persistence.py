@@ -12,7 +12,14 @@ def replace_project_drama(
     drama: StructuredDrama,
 ) -> dict:
     with session_scope(database_url) as session:
-        project = session.get(Project, project_id)
+        connection = session.connection()
+        if connection.dialect.name == "sqlite":
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+            project = session.get(Project, project_id)
+        else:
+            project = session.scalar(
+                select(Project).where(Project.id == project_id).with_for_update()
+            )
         if project is None:
             raise ValueError("project not found")
 
@@ -28,20 +35,32 @@ def replace_project_drama(
                     raise ValueError(f"duplicate {label}: {key}")
                 seen.add(key)
 
-        old_scene_ids = list(
-            session.scalars(select(Scene.id).where(Scene.project_id == project_id))
-        )
-        if old_scene_ids:
-            session.execute(delete(Scene).where(Scene.id.in_(old_scene_ids)))
+        character_names = {spec.name for spec in drama.characters}
+        for spec in drama.shots:
+            if spec.character_name is not None and spec.character_name not in character_names:
+                raise ValueError(
+                    f"shot {spec.order} references missing character {spec.character_name}"
+                )
+        for spec in drama.dialogues:
+            if spec.character_name is not None and spec.character_name not in character_names:
+                raise ValueError(
+                    "dialogue for shot "
+                    f"{spec.shot_order} references missing character {spec.character_name}"
+                )
+
+        session.execute(delete(Scene).where(Scene.project_id == project_id))
         session.execute(delete(Character).where(Character.project_id == project_id))
 
         characters = {}
         for spec in drama.characters:
+            face = spec.face
+            if spec.appearance and "face" not in spec.model_fields_set:
+                face = spec.appearance
             bible = VisualBible(
                 name=spec.name,
                 age=spec.age,
                 gender=spec.gender,
-                face=spec.face,
+                face=face,
                 eyes=spec.eyes,
                 nose=spec.nose,
                 mouth=spec.mouth,
