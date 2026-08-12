@@ -187,14 +187,18 @@ def _validate_wav_payload(
     channels: int,
     sample_width: int,
 ) -> None:
-    expected_bytes = frames * channels * sample_width
+    frame_size = channels * sample_width
+    remaining_frames = frames
     try:
         with wave.open(str(path), "rb") as source:
-            payload = source.readframes(frames)
+            while remaining_frames:
+                requested_frames = min(remaining_frames, 16_384)
+                payload = source.readframes(requested_frames)
+                if len(payload) != requested_frames * frame_size:
+                    raise ValueError(f"WAV has a truncated PCM payload: {path}")
+                remaining_frames -= requested_frames
     except (EOFError, OSError, wave.Error) as exc:
         raise ValueError(f"WAV has a truncated PCM payload: {path}") from exc
-    if len(payload) != expected_bytes:
-        raise ValueError(f"WAV has a truncated PCM payload: {path}")
 
 
 def build_render_timeline(database_url: str, project_id: str) -> RenderTimeline:

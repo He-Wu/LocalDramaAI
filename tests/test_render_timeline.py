@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import select
 
+import app.services.render_timeline as render_timeline
 from app.db.session import create_schema, session_scope
 from app.models import Asset, Dialogue, Project, Scene, Shot
 from app.services.render_timeline import (
@@ -497,6 +498,40 @@ def test_timeline_rejects_wav_with_truncated_declared_pcm_payload(seed_project):
 
     with pytest.raises(ValueError, match="truncated PCM payload"):
         build_render_timeline(seed_project.database, seed_project.project_id)
+
+
+def test_wav_payload_validation_never_requests_unbounded_declared_frames(
+    tmp_path, monkeypatch
+):
+    requested_frames = []
+
+    class ControlledWave:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def readframes(self, frames):
+            requested_frames.append(frames)
+            return b""
+
+    monkeypatch.setattr(
+        render_timeline.wave,
+        "open",
+        lambda *_args, **_kwargs: ControlledWave(),
+    )
+
+    with pytest.raises(ValueError, match="truncated PCM payload"):
+        render_timeline._validate_wav_payload(
+            tmp_path / "huge-declaration.wav",
+            frames=1_073_741_823,
+            channels=2,
+            sample_width=2,
+        )
+
+    assert requested_frames
+    assert max(requested_frames) <= 16_384
 
 
 def test_timeline_rejects_projects_without_shots(seed_project):
