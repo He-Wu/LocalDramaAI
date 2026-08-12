@@ -192,7 +192,10 @@ class FFmpegRenderProvider:
                 or _sha256(shot.video_path) != shot.video_sha256
             ):
                 raise ValueError
-            source = probe_video(shot.video_path)
+            source = probe_video(
+                shot.video_path,
+                executable=str(self.probe_executable),
+            )
         except (OSError, ValueError) as exc:
             raise ValueError(f"Shot source is missing, corrupt, or changed: {shot.shot_id}") from exc
         coverage = source.duration
@@ -352,7 +355,7 @@ class FFmpegRenderProvider:
             raise RuntimeError("rendered output does not match the locked A/V profile")
         self._run(
             [
-                str(self.executable), "-hide_banner", "-loglevel", "error", "-nostdin",
+                str(self.executable), "-hide_banner", "-loglevel", "error", "-xerror", "-nostdin",
                 "-i", str(path), "-map", "0:v:0", "-map", "0:a:0", "-f", "null", os.devnull,
             ],
             cwd=path.parent,
@@ -394,7 +397,13 @@ class FFmpegRenderProvider:
             identity = self._identity(job_dir)
             fonts_dir = job_dir / "fonts"
             fonts_dir.mkdir()
-            shutil.copyfile(identity.font_path, fonts_dir / "locked-font.ttc")
+            staged_font = fonts_dir / "locked-font.ttc"
+            shutil.copyfile(identity.font_path, staged_font)
+            if (
+                staged_font.stat().st_size != identity.font_size
+                or _sha256(staged_font) != identity.font_sha256
+            ):
+                raise RuntimeError("staged font does not match attested identity")
             (job_dir / "subtitles.srt").write_bytes(srt)
             clips = [
                 self._normalize_shot(timeline, shot, index, job_dir)

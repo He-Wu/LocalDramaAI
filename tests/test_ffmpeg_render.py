@@ -219,6 +219,31 @@ def test_renderer_rejects_source_that_no_longer_covers_snapshot_duration(
     assert not list(render_fixture.output.parent.glob(".*.tmp"))
 
 
+def test_source_probe_uses_attested_ffprobe_executable(
+    render_fixture: RenderFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.providers.ffmpeg_render_provider as render_module
+
+    original = render_module.probe_video
+    observed: list[str] = []
+
+    def recording_probe(path: Path, executable: str = "ffprobe"):
+        observed.append(executable)
+        return original(path, executable=executable)
+
+    monkeypatch.setattr(render_module, "probe_video", recording_probe)
+    provider = FFmpegRenderProvider()
+    provider.render(
+        render_fixture.timeline,
+        render_fixture.srt,
+        render_fixture.output,
+        render_fixture.manifest,
+    )
+
+    assert observed == [str(provider.probe_executable)] * 2
+
+
 def test_resolve_native_executable_rejects_shell_wrapper(tmp_path: Path) -> None:
     wrapper = tmp_path / "ffmpeg.cmd"
     wrapper.write_text("@exit /b 0\n", encoding="ascii")
@@ -284,6 +309,31 @@ def test_renderer_rejects_missing_locked_font_without_publication(
 
     with pytest.raises(RuntimeError, match="font"):
         provider.render(
+            render_fixture.timeline,
+            render_fixture.srt,
+            render_fixture.output,
+            render_fixture.manifest,
+        )
+
+    assert not render_fixture.output.exists()
+    assert not render_fixture.manifest.exists()
+
+
+def test_renderer_rejects_font_changed_between_identity_and_staging(
+    render_fixture: RenderFixture,
+    tmp_path: Path,
+) -> None:
+    font = tmp_path / "mutable-font.ttc"
+    font.write_bytes(FFmpegRenderProvider().font_path.read_bytes())
+
+    class RacingFontProvider(FFmpegRenderProvider):
+        def _identity(self, cwd):
+            identity = super()._identity(cwd)
+            self.font_path.write_bytes(b"changed after identity")
+            return identity
+
+    with pytest.raises(RuntimeError, match="staged font.*identity"):
+        RacingFontProvider(font_path=font).render(
             render_fixture.timeline,
             render_fixture.srt,
             render_fixture.output,
@@ -618,6 +668,26 @@ def test_renderer_rejects_malformed_candidate_without_publication(
 
     assert not render_fixture.output.exists()
     assert not render_fixture.manifest.exists()
+
+
+def test_full_decode_escalates_decoder_errors(render_fixture: RenderFixture) -> None:
+    observed: list[list[str]] = []
+
+    class RecordingProvider(FFmpegRenderProvider):
+        def _run(self, arguments, *, cwd, capture_stdout=False):
+            if "-f" in arguments and arguments[arguments.index("-f") + 1] == "null":
+                observed.append(list(arguments))
+            return super()._run(arguments, cwd=cwd, capture_stdout=capture_stdout)
+
+    RecordingProvider().render(
+        render_fixture.timeline,
+        render_fixture.srt,
+        render_fixture.output,
+        render_fixture.manifest,
+    )
+
+    assert len(observed) == 1
+    assert "-xerror" in observed[0]
 
 
 def test_renderer_rejects_candidate_with_wrong_frame_count(
