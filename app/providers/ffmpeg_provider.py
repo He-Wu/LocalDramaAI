@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import subprocess
 import tempfile
@@ -118,6 +119,68 @@ class FFmpegProvider:
                     "-shortest",
                     "-movflags",
                     "+faststart",
+                    str(temp),
+                ]
+            )
+            self._replace_nonempty(temp, output_path)
+            return output_path
+        finally:
+            temp.unlink(missing_ok=True)
+
+    def concat_audio(self, inputs: list[Path], output_path: Path) -> Path:
+        if not inputs:
+            raise ValueError("audio concat requires at least one input")
+        normalized_inputs = [
+            self._validated_input(path, "audio concat input") for path in inputs
+        ]
+        output_path = Path(output_path)
+        temp = self._temporary_path(output_path)
+        try:
+            filters = [
+                f"[{index}:a:0]aresample=48000,"
+                "aformat=sample_fmts=s16:channel_layouts=stereo"
+                f"[a{index}]"
+                for index in range(len(normalized_inputs))
+            ]
+            joined = "".join(f"[a{index}]" for index in range(len(normalized_inputs)))
+            filters.append(f"{joined}concat=n={len(normalized_inputs)}:v=0:a=1[out]")
+            args = [self.executable, "-nostdin", "-y"]
+            for path in normalized_inputs:
+                args += ["-i", str(path)]
+            args += [
+                "-filter_complex",
+                ";".join(filters),
+                "-map",
+                "[out]",
+                "-c:a",
+                "pcm_s16le",
+                str(temp),
+            ]
+            self._run(args)
+            self._replace_nonempty(temp, output_path)
+            return output_path
+        finally:
+            temp.unlink(missing_ok=True)
+
+    def create_silence(self, output_path: Path, duration: float) -> Path:
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError("silence duration must be a positive finite number")
+        output_path = Path(output_path)
+        temp = self._temporary_path(output_path)
+        try:
+            self._run(
+                [
+                    self.executable,
+                    "-nostdin",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "anullsrc=r=48000:cl=stereo",
+                    "-t",
+                    str(duration),
+                    "-c:a",
+                    "pcm_s16le",
                     str(temp),
                 ]
             )

@@ -1,4 +1,6 @@
 import json
+import shutil
+import sqlite3
 import subprocess
 import sys
 import wave
@@ -7,8 +9,12 @@ from types import SimpleNamespace
 
 import pytest
 from PIL import Image
+from sqlalchemy.exc import IntegrityError
 
+from app.db.session import create_schema, session_scope
+from app.models import Asset, Dialogue, GenerationManifest, Project, Scene, Shot
 from app.providers.ffmpeg_provider import FFmpegProvider
+from app.services.audio_probe import probe_wav
 
 
 def _wav(path: Path, seconds: float = 1.0) -> Path:
@@ -408,3 +414,744 @@ def test_concat_rejects_newline_path_before_launch(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="newline"):
         provider.concat([unsafe], tmp_path / "output.mp4")
+
+
+def test_concat_audio_preserves_dialogue_order_and_normalizes_pcm(tmp_path):
+    provider = FFmpegProvider()
+    first = _wav(tmp_path / "first.wav", seconds=0.2)
+    second = _wav(tmp_path / "second.wav", seconds=0.3)
+
+    output = provider.concat_audio([first, second], tmp_path / "dialogues.wav")
+
+    info = probe_wav(output)
+    assert info.duration == pytest.approx(0.5, abs=0.002)
+    assert info.sample_rate == 48000
+    assert info.channels == 2
+    assert info.sample_width == 2
+
+
+def test_create_silence_writes_requested_normalized_duration(tmp_path):
+    output = FFmpegProvider().create_silence(tmp_path / "silence.wav", duration=0.45)
+
+    info = probe_wav(output)
+    assert info.duration == pytest.approx(0.45, abs=0.002)
+    assert info.sample_rate == 48000
+    assert info.channels == 2
+
+
+def _seed_render_project(tmp_path: Path, *, name: str = "成片测试") -> dict:
+    provider = FFmpegProvider()
+    source_dir = tmp_path / f"{name}-sources"
+    source_dir.mkdir()
+    red_video = _video(
+        provider, source_dir / "red.mp4", (220, 20, 20), seconds=1.3
+    )
+    green_video = _video(
+        provider, source_dir / "green.mp4", (20, 220, 20), seconds=0.8
+    )
+    blue_video = _video(
+        provider, source_dir / "blue.mp4", (20, 20, 220), seconds=0.75
+    )
+    first_audio = _wav(source_dir / "first.wav", seconds=0.4)
+    second_audio = _wav(source_dir / "second.wav", seconds=0.5)
+    third_audio = _wav(source_dir / "third.wav", seconds=0.5)
+    database = str(tmp_path / f"{name}.db")
+    create_schema(database)
+    with session_scope(database) as session:
+        project = Project(
+            name=name,
+            story="回家",
+            description="三镜头短剧",
+            language="zh-CN",
+            style="电影感",
+        )
+        session.add(project)
+        session.flush()
+        later_scene = Scene(
+            project_id=project.id,
+            order=2,
+            title="街口",
+            description="抵达街口",
+        )
+        first_scene = Scene(
+            project_id=project.id,
+            order=1,
+            title="巷子",
+            description="穿过巷子",
+        )
+        session.add_all([later_scene, first_scene])
+        session.flush()
+        video_assets = [
+            Asset(
+                project_id=project.id,
+                kind="VIDEO",
+                path=str(path),
+                mime_type="video/mp4",
+            )
+            for path in (red_video, green_video, blue_video)
+        ]
+        audio_assets = [
+            Asset(
+                project_id=project.id,
+                kind="AUDIO",
+                path=str(path),
+                mime_type="audio/wav",
+                metadata_json={"duration": duration},
+            )
+            for path, duration in (
+                (first_audio, 0.4),
+                (second_audio, 0.5),
+                (third_audio, 0.5),
+            )
+        ]
+        session.add_all([*video_assets, *audio_assets])
+        session.flush()
+        blue_shot = Shot(
+            scene_id=later_scene.id,
+            order=2,
+            title="蓝色远景",
+            description="看见家门",
+            duration=0.75,
+            video_asset_id=video_assets[2].id,
+        )
+        silent_shot = Shot(
+            scene_id=later_scene.id,
+            order=1,
+            title="绿色空镜",
+            description="停顿",
+            duration=0.8,
+            video_asset_id=video_assets[1].id,
+        )
+        red_shot = Shot(
+            scene_id=first_scene.id,
+            order=1,
+            title="红色近景",
+            description="连续说两句",
+            duration=1.3,
+            video_asset_id=video_assets[0].id,
+        )
+        session.add_all([blue_shot, silent_shot, red_shot])
+        session.flush()
+        session.add_all(
+            [
+                Dialogue(
+                    shot_id=red_shot.id,
+                    order=2,
+                    text="第二句，继续走。",
+                    duration=0.5,
+                    audio_asset_id=audio_assets[1].id,
+                ),
+                Dialogue(
+                    shot_id=red_shot.id,
+                    order=1,
+                    text="第一句。",
+                    duration=0.4,
+                    audio_asset_id=audio_assets[0].id,
+                ),
+                Dialogue(
+                    shot_id=blue_shot.id,
+                    order=1,
+                    text="到了。",
+                    duration=0.5,
+                    audio_asset_id=audio_assets[2].id,
+                ),
+            ]
+        )
+        session.add(
+            GenerationManifest(
+                asset_id=video_assets[0].id,
+                provider="comfyui",
+                provider_version="0.31.0",
+                model_name="wan2.2",
+                prompt="红色近景",
+                negative_prompt="模糊",
+                seed=42,
+                workflow_name="wan-i2v",
+                workflow_hash="workflow-sha",
+                binding_version="1",
+                generation_time=1.25,
+                input_assets=[audio_assets[0].id, audio_assets[1].id],
+                output_asset=video_assets[0].id,
+            )
+        )
+        session.flush()
+        return {
+            "database": database,
+            "project_id": project.id,
+            "shot_ids": [red_shot.id, silent_shot.id, blue_shot.id],
+            "video_asset_ids": [asset.id for asset in video_assets],
+            "audio_asset_ids": [asset.id for asset in audio_assets],
+            "source_videos": [red_video, green_video, blue_video],
+        }
+
+
+def _render_service(seed: dict, tmp_path: Path, provider=None):
+    from app.services.final_render import FinalRenderService
+
+    return FinalRenderService(
+        seed["database"],
+        provider or FFmpegProvider(),
+        tmp_path / "exports",
+    )
+
+
+def test_service_muxes_ordered_shots_multiple_dialogues_and_silence(tmp_path):
+    seed = _seed_render_project(tmp_path)
+    service = _render_service(seed, tmp_path)
+
+    result = service.mux_shots(seed["project_id"])
+
+    assert result["shot_ids"] == seed["shot_ids"]
+    assert len(result["muxed_paths"]) == 3
+    for muxed_path, source_path in zip(result["muxed_paths"], seed["source_videos"]):
+        muxed = _probe(Path(muxed_path))
+        source = _probe(source_path)
+        assert {stream["codec_type"] for stream in muxed["streams"]} >= {"video", "audio"}
+        assert float(muxed["format"]["duration"]) == pytest.approx(
+            float(source["format"]["duration"]), abs=0.08
+        )
+    first_audio = next(
+        stream
+        for stream in _probe(Path(result["muxed_paths"][0]))["streams"]
+        if stream["codec_type"] == "audio"
+    )
+    assert float(first_audio["duration"]) >= 1.25
+    silent_audio = next(
+        stream
+        for stream in _probe(Path(result["muxed_paths"][1]))["streams"]
+        if stream["codec_type"] == "audio"
+    )
+    assert silent_audio["codec_name"] == "aac"
+    assert silent_audio["sample_rate"] == "48000"
+    assert silent_audio["channels"] == 2
+
+
+def test_concat_project_registers_one_probed_h264_aac_final(tmp_path):
+    seed = _seed_render_project(tmp_path)
+    service = _render_service(seed, tmp_path)
+    muxed = service.mux_shots(seed["project_id"])["muxed_paths"]
+
+    result = service.concat_project(seed["project_id"], muxed)
+
+    probe = _probe(Path(result["path"]))
+    video = next(stream for stream in probe["streams"] if stream["codec_type"] == "video")
+    audio = next(stream for stream in probe["streams"] if stream["codec_type"] == "audio")
+    assert video["codec_name"] == "h264"
+    assert audio["codec_name"] == "aac"
+    assert float(probe["format"]["duration"]) == pytest.approx(2.85, abs=0.15)
+    assert result["metadata"]["sha256"] == _sha256(Path(result["path"]))
+    with session_scope(seed["database"]) as session:
+        assets = session.query(Asset).filter_by(
+            project_id=seed["project_id"], kind="FINAL_VIDEO"
+        ).all()
+        assert len(assets) == 1
+        assert assets[0].id == result["asset_id"]
+        assert assets[0].mime_type == "video/mp4"
+
+
+def _sha256(path: Path) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def test_export_subtitles_uses_persisted_dialogue_durations_and_media_tails(tmp_path):
+    seed = _seed_render_project(tmp_path)
+    service = _render_service(seed, tmp_path)
+
+    result = service.export_subtitles(seed["project_id"])
+
+    path = Path(result["path"])
+    assert path.read_bytes().startswith(b"\xef\xbb\xbf")
+    assert path.read_text(encoding="utf-8-sig") == (
+        "1\n00:00:00,000 --> 00:00:00,400\n第一句。\n\n"
+        "2\n00:00:00,400 --> 00:00:00,900\n第二句，继续走。\n\n"
+        "3\n00:00:02,100 --> 00:00:02,600\n到了。\n"
+    )
+    with session_scope(seed["database"]) as session:
+        asset = session.get(Asset, result["asset_id"])
+        assert asset.kind == "SUBTITLE"
+        assert asset.mime_type == "application/x-subrip"
+
+
+def test_subtitle_timeline_follows_persisted_shot_boundaries(tmp_path):
+    seed = _seed_render_project(tmp_path)
+    service = _render_service(seed, tmp_path)
+
+    result = service.export_subtitles(seed["project_id"])
+
+    text = Path(result["path"]).read_text(encoding="utf-8-sig")
+    assert "00:00:02,100 --> 00:00:02,600\n到了。" in text
+
+
+def test_export_manifest_is_deterministic_and_contains_hash_evidence(tmp_path):
+    seed = _seed_render_project(tmp_path)
+    service = _render_service(seed, tmp_path)
+    muxed = service.mux_shots(seed["project_id"])["muxed_paths"]
+    final = service.concat_project(seed["project_id"], muxed)
+    service.export_subtitles(seed["project_id"])
+    secret = tmp_path / "unrelated-secret.txt"
+    secret.write_text("DO NOT READ THIS VALUE", encoding="utf-8")
+    with session_scope(seed["database"]) as session:
+        session.get(Asset, seed["video_asset_ids"][0]).metadata_json = {
+            "manifest_path": str(secret)
+        }
+
+    first = service.export_manifest(seed["project_id"], final["asset_id"])
+    first_bytes = Path(first["path"]).read_bytes()
+    second = service.export_manifest(seed["project_id"], final["asset_id"])
+
+    assert Path(second["path"]).read_bytes() == first_bytes
+    assert first["sha256"] == second["sha256"] == _sha256(Path(first["path"]))
+    payload = json.loads(first_bytes)
+    assert payload["project"]["id"] == seed["project_id"]
+    assert [scene["order"] for scene in payload["scenes"]] == [1, 2]
+    assert [shot["id"] for shot in payload["shots"]] == seed["shot_ids"]
+    assert [dialogue["text"] for dialogue in payload["dialogues"]] == [
+        "第一句。",
+        "第二句，继续走。",
+        "到了。",
+    ]
+    assert all(len(asset["sha256"]) == 64 for asset in payload["assets"])
+    assert payload["generation_manifests"] == [
+        {
+            "asset_id": seed["video_asset_ids"][0],
+            "binding_version": "1",
+            "generation_time": 1.25,
+            "input_assets": seed["audio_asset_ids"][:2],
+            "model_name": "wan2.2",
+            "output_asset": seed["video_asset_ids"][0],
+            "provider": "comfyui",
+            "provider_version": "0.31.0",
+            "seed": 42,
+            "workflow_hash": "workflow-sha",
+            "workflow_name": "wan-i2v",
+        }
+    ]
+    assert b"DO NOT READ THIS VALUE" not in first_bytes
+    with session_scope(seed["database"]) as session:
+        assets = session.query(Asset).filter_by(
+            project_id=seed["project_id"], kind="MANIFEST"
+        ).all()
+        assert len(assets) == 1
+        assert assets[0].id == first["asset_id"] == second["asset_id"]
+
+
+def test_render_is_idempotent_and_regenerates_corrupted_outputs(tmp_path):
+    seed = _seed_render_project(tmp_path)
+    service = _render_service(seed, tmp_path)
+
+    first = service.render(seed["project_id"])
+    second = service.render(seed["project_id"])
+    assert {key: first[key] for key in ("video_asset_id", "subtitle_asset_id", "manifest_asset_id")} == {
+        key: second[key] for key in ("video_asset_id", "subtitle_asset_id", "manifest_asset_id")
+    }
+    assert all(Path(first[key]).is_file() for key in ("video_path", "subtitle_path", "manifest_path"))
+    Path(first["video_path"]).write_bytes(b"corrupt video")
+    Path(first["subtitle_path"]).write_bytes(b"corrupt subtitle")
+    Path(first["manifest_path"]).write_bytes(b"corrupt manifest")
+
+    repaired = service.render(seed["project_id"])
+
+    assert repaired["video_asset_id"] == first["video_asset_id"]
+    assert repaired["subtitle_asset_id"] == first["subtitle_asset_id"]
+    assert repaired["manifest_asset_id"] == first["manifest_asset_id"]
+    assert _probe(Path(repaired["video_path"]))["streams"]
+    assert Path(repaired["subtitle_path"]).read_bytes().startswith(b"\xef\xbb\xbf")
+    assert json.loads(Path(repaired["manifest_path"]).read_text(encoding="utf-8"))
+    with session_scope(seed["database"]) as session:
+        for kind in ("FINAL_VIDEO", "SUBTITLE", "MANIFEST"):
+            assert session.query(Asset).filter_by(
+                project_id=seed["project_id"], kind=kind
+            ).count() == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("video_kind", "AUDIO", "VIDEO"),
+        ("video_file", b"not video", "video"),
+        ("audio_kind", "VIDEO", "AUDIO"),
+        ("audio_file", b"not wav", "WAV"),
+        ("audio_duration", 9.0, "duration"),
+    ],
+)
+def test_mux_rejects_invalid_persisted_media_without_final_registration(
+    tmp_path, field, value, message
+):
+    seed = _seed_render_project(tmp_path)
+    with session_scope(seed["database"]) as session:
+        if field == "video_kind":
+            session.get(Asset, seed["video_asset_ids"][0]).kind = value
+        elif field == "video_file":
+            Path(session.get(Asset, seed["video_asset_ids"][0]).path).write_bytes(value)
+        elif field == "audio_kind":
+            session.get(Asset, seed["audio_asset_ids"][0]).kind = value
+        elif field == "audio_file":
+            Path(session.get(Asset, seed["audio_asset_ids"][0]).path).write_bytes(value)
+        else:
+            first_dialogue = session.query(Dialogue).filter_by(
+                audio_asset_id=seed["audio_asset_ids"][0]
+            ).one()
+            first_dialogue.duration = value
+
+    with pytest.raises((ValueError, RuntimeError), match=message):
+        _render_service(seed, tmp_path).mux_shots(seed["project_id"])
+    with session_scope(seed["database"]) as session:
+        assert session.query(Asset).filter_by(kind="FINAL_VIDEO").count() == 0
+
+
+def test_ffmpeg_concat_failure_preserves_prior_final_asset_and_file(tmp_path):
+    seed = _seed_render_project(tmp_path)
+    service = _render_service(seed, tmp_path)
+    muxed = service.mux_shots(seed["project_id"])["muxed_paths"]
+    final = service.concat_project(seed["project_id"], muxed)
+    final_bytes = Path(final["path"]).read_bytes()
+    _video(
+        FFmpegProvider(),
+        seed["source_videos"][0],
+        (120, 20, 120),
+        seconds=1.3,
+    )
+    muxed = service.mux_shots(seed["project_id"])["muxed_paths"]
+
+    class FailingConcatProvider(FFmpegProvider):
+        def concat(self, inputs, output_path):
+            raise RuntimeError("FFmpeg failed intentionally")
+
+    failing_service = _render_service(seed, tmp_path, FailingConcatProvider())
+    with pytest.raises(RuntimeError, match="intentionally"):
+        failing_service.concat_project(seed["project_id"], muxed)
+
+    assert Path(final["path"]).read_bytes() == final_bytes
+    with session_scope(seed["database"]) as session:
+        asset = session.query(Asset).filter_by(kind="FINAL_VIDEO").one()
+        assert asset.id == final["asset_id"]
+        assert asset.metadata_json["sha256"] == _sha256(Path(final["path"]))
+
+
+def test_mux_validation_failure_preserves_prior_valid_mux(tmp_path):
+    seed = _seed_render_project(tmp_path)
+    service = _render_service(seed, tmp_path)
+    muxed = service.mux_shots(seed["project_id"])["muxed_paths"]
+    prior_path = Path(muxed[0])
+    prior_bytes = prior_path.read_bytes()
+    vp9_path = tmp_path / "vp9.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-y",
+            "-i",
+            str(seed["source_videos"][0]),
+            "-c:v",
+            "libvpx-vp9",
+            "-an",
+            str(vp9_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    vp9_path.replace(seed["source_videos"][0])
+
+    with pytest.raises(ValueError, match="H.264"):
+        service.mux_shots(seed["project_id"])
+
+    assert prior_path.read_bytes() == prior_bytes
+
+
+def test_final_validation_failure_preserves_prior_valid_final(tmp_path):
+    seed = _seed_render_project(tmp_path)
+    service = _render_service(seed, tmp_path)
+    muxed = service.mux_shots(seed["project_id"])["muxed_paths"]
+    final = service.concat_project(seed["project_id"], muxed)
+    final_path = Path(final["path"])
+    prior_bytes = final_path.read_bytes()
+    _video(
+        FFmpegProvider(),
+        seed["source_videos"][0],
+        (120, 40, 100),
+        seconds=1.3,
+    )
+    muxed = service.mux_shots(seed["project_id"])["muxed_paths"]
+
+    class InvalidConcatProvider(FFmpegProvider):
+        def concat(self, inputs, output_path):
+            shutil.copy2(seed["source_videos"][0], output_path)
+            return Path(output_path)
+
+    with pytest.raises(ValueError, match="audio stream"):
+        _render_service(seed, tmp_path, InvalidConcatProvider()).concat_project(
+            seed["project_id"], muxed
+        )
+
+    assert final_path.read_bytes() == prior_bytes
+
+
+def test_final_duration_validation_rejects_truncated_valid_media(tmp_path):
+    seed = _seed_render_project(tmp_path)
+    service = _render_service(seed, tmp_path)
+    muxed = service.mux_shots(seed["project_id"])["muxed_paths"]
+
+    class TruncatedConcatProvider(FFmpegProvider):
+        def concat(self, inputs, output_path):
+            shutil.copy2(inputs[0], output_path)
+            return Path(output_path)
+
+    with pytest.raises(ValueError, match="duration"):
+        _render_service(seed, tmp_path, TruncatedConcatProvider()).concat_project(
+            seed["project_id"], muxed
+        )
+
+    with session_scope(seed["database"]) as session:
+        assert session.query(Asset).filter_by(kind="FINAL_VIDEO").count() == 0
+
+
+def test_final_duration_tolerance_cannot_hide_dropped_short_shot(tmp_path):
+    seed = _seed_render_project(tmp_path)
+    short_video = _video(
+        FFmpegProvider(),
+        tmp_path / "short-shot.mp4",
+        (30, 30, 220),
+        seconds=0.0625,
+    )
+    short_duration = float(_probe(short_video)["format"]["duration"])
+    with session_scope(seed["database"]) as session:
+        short_asset = session.get(Asset, seed["video_asset_ids"][2])
+        short_asset.path = str(short_video)
+        session.get(Shot, seed["shot_ids"][2]).duration = short_duration
+        short_dialogue = session.query(Dialogue).filter_by(
+            shot_id=seed["shot_ids"][2]
+        ).one()
+        session.delete(short_dialogue)
+    service = _render_service(seed, tmp_path)
+    muxed = service.mux_shots(seed["project_id"])["muxed_paths"]
+
+    class DropsLastShotProvider(FFmpegProvider):
+        def concat(self, inputs, output_path):
+            return super().concat(inputs[:-1], output_path)
+
+    with pytest.raises(ValueError, match="duration"):
+        _render_service(seed, tmp_path, DropsLastShotProvider()).concat_project(
+            seed["project_id"], muxed
+        )
+
+    with session_scope(seed["database"]) as session:
+        assert session.query(Asset).filter_by(kind="FINAL_VIDEO").count() == 0
+
+
+def test_first_concat_failure_does_not_register_final_asset(tmp_path):
+    seed = _seed_render_project(tmp_path)
+    muxed = _render_service(seed, tmp_path).mux_shots(seed["project_id"])[
+        "muxed_paths"
+    ]
+
+    class FailingConcatProvider(FFmpegProvider):
+        def concat(self, inputs, output_path):
+            raise RuntimeError("FFmpeg failed before output")
+
+    with pytest.raises(RuntimeError, match="before output"):
+        _render_service(seed, tmp_path, FailingConcatProvider()).concat_project(
+            seed["project_id"], muxed
+        )
+
+    with session_scope(seed["database"]) as session:
+        assert session.query(Asset).filter_by(kind="FINAL_VIDEO").count() == 0
+
+
+def test_database_registration_failure_rolls_back_asset_row(tmp_path):
+    seed = _seed_render_project(tmp_path)
+    service = _render_service(seed, tmp_path)
+    muxed = service.mux_shots(seed["project_id"])["muxed_paths"]
+    with sqlite3.connect(seed["database"]) as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER reject_final_registration
+            BEFORE INSERT ON assets
+            WHEN NEW.kind = 'FINAL_VIDEO'
+            BEGIN
+                SELECT RAISE(ABORT, 'registration rejected');
+            END
+            """
+        )
+
+    with pytest.raises(IntegrityError, match="registration rejected"):
+        service.concat_project(seed["project_id"], muxed)
+
+    with session_scope(seed["database"]) as session:
+        assert session.query(Asset).filter_by(kind="FINAL_VIDEO").count() == 0
+    final_path = tmp_path / "exports" / seed["project_id"] / "final.mp4"
+    assert _probe(final_path)["streams"]
+
+
+def test_concat_rejects_stale_mux_evidence(tmp_path):
+    seed = _seed_render_project(tmp_path)
+    service = _render_service(seed, tmp_path)
+    muxed = service.mux_shots(seed["project_id"])["muxed_paths"]
+    state_path = Path(muxed[0]).with_suffix(".mux.json")
+    state_path.write_text('{"input_hash": "stale", "output_sha256": "stale"}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="evidence"):
+        service.concat_project(seed["project_id"], muxed)
+
+    with session_scope(seed["database"]) as session:
+        assert session.query(Asset).filter_by(kind="FINAL_VIDEO").count() == 0
+
+
+def test_mux_regenerates_non_object_state_file(tmp_path):
+    seed = _seed_render_project(tmp_path)
+    service = _render_service(seed, tmp_path)
+    first = service.mux_shots(seed["project_id"])
+    state_path = Path(first["muxed_paths"][0]).with_suffix(".mux.json")
+    state_path.write_text("[]", encoding="utf-8")
+
+    second = service.mux_shots(seed["project_id"])
+
+    assert second["muxed_paths"] == first["muxed_paths"]
+    assert isinstance(json.loads(state_path.read_text(encoding="utf-8")), dict)
+
+
+def test_concat_rejects_non_object_mux_evidence_as_invalid(tmp_path):
+    seed = _seed_render_project(tmp_path)
+    service = _render_service(seed, tmp_path)
+    muxed = service.mux_shots(seed["project_id"])["muxed_paths"]
+    Path(muxed[0]).with_suffix(".mux.json").write_text("null", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="evidence"):
+        service.concat_project(seed["project_id"], muxed)
+
+
+def test_manifest_rejects_project_asset_outside_deterministic_final_path(tmp_path):
+    seed = _seed_render_project(tmp_path)
+    service = _render_service(seed, tmp_path)
+    muxed = service.mux_shots(seed["project_id"])["muxed_paths"]
+    with session_scope(seed["database"]) as session:
+        fake_final = Asset(
+            project_id=seed["project_id"],
+            kind="FINAL_VIDEO",
+            path=muxed[0],
+            mime_type="video/mp4",
+        )
+        session.add(fake_final)
+        session.flush()
+        fake_final_id = fake_final.id
+
+    with pytest.raises(ValueError, match="project output"):
+        service.export_manifest(seed["project_id"], fake_final_id)
+
+    with session_scope(seed["database"]) as session:
+        assert session.query(Asset).filter_by(kind="MANIFEST").count() == 0
+
+
+def test_manifest_rejects_replaced_final_video_with_stale_registration(tmp_path):
+    seed = _seed_render_project(tmp_path)
+    service = _render_service(seed, tmp_path)
+    muxed = service.mux_shots(seed["project_id"])["muxed_paths"]
+    final = service.concat_project(seed["project_id"], muxed)
+    shutil.copyfile(muxed[0], final["path"])
+
+    with pytest.raises(ValueError, match="registered.*evidence"):
+        service.export_manifest(seed["project_id"], final["asset_id"])
+
+    with session_scope(seed["database"]) as session:
+        assert session.query(Asset).filter_by(kind="MANIFEST").count() == 0
+
+
+def test_manifest_rejects_foreign_generation_input_assets(tmp_path):
+    seed = _seed_render_project(tmp_path)
+    service = _render_service(seed, tmp_path)
+    muxed = service.mux_shots(seed["project_id"])["muxed_paths"]
+    final = service.concat_project(seed["project_id"], muxed)
+    with session_scope(seed["database"]) as session:
+        other_project = Project(name="外部生成输入")
+        session.add(other_project)
+        session.flush()
+        foreign_input = Asset(
+            project_id=other_project.id,
+            kind="AUDIO",
+            path=str(tmp_path / "unused.wav"),
+            mime_type="audio/wav",
+        )
+        session.add(foreign_input)
+        session.flush()
+        session.query(GenerationManifest).filter_by(
+            asset_id=seed["video_asset_ids"][0]
+        ).one().input_assets = [foreign_input.id]
+
+    with pytest.raises(ValueError, match="input asset.*belong"):
+        service.export_manifest(seed["project_id"], final["asset_id"])
+
+    with session_scope(seed["database"]) as session:
+        assert session.query(Asset).filter_by(kind="MANIFEST").count() == 0
+
+
+def test_manifest_allows_non_asset_generation_provenance_tokens(tmp_path):
+    seed = _seed_render_project(tmp_path)
+    service = _render_service(seed, tmp_path)
+    muxed = service.mux_shots(seed["project_id"])["muxed_paths"]
+    final = service.concat_project(seed["project_id"], muxed)
+    with session_scope(seed["database"]) as session:
+        session.query(GenerationManifest).filter_by(
+            asset_id=seed["video_asset_ids"][0]
+        ).one().input_assets = ["phase4_reference_image.png"]
+
+    manifest = service.export_manifest(seed["project_id"], final["asset_id"])
+
+    payload = json.loads(Path(manifest["path"]).read_text(encoding="utf-8"))
+    assert payload["generation_manifests"][0]["input_assets"] == [
+        "phase4_reference_image.png"
+    ]
+
+
+def test_project_ownership_is_enforced_for_inputs_and_final_asset(tmp_path):
+    first = _seed_render_project(tmp_path, name="项目一")
+    second_dir = tmp_path / "other"
+    second_dir.mkdir()
+    second = _seed_render_project(second_dir, name="项目二")
+    service = _render_service(first, tmp_path)
+    with session_scope(first["database"]) as session:
+        foreign_video_path = second["source_videos"][0]
+        foreign = Asset(
+            project_id=first["project_id"],
+            kind="VIDEO",
+            path=str(foreign_video_path),
+            mime_type="video/mp4",
+        )
+        session.add(foreign)
+        session.flush()
+        # A cross-project row cannot exist across separate DBs, so create a second
+        # project in the same DB and deliberately link its asset from the first.
+        other_project = Project(name="同库外部项目")
+        session.add(other_project)
+        session.flush()
+        foreign.project_id = other_project.id
+        first_shot = session.get(Shot, first["shot_ids"][0])
+        original_video_id = first_shot.video_asset_id
+        first_shot.video_asset_id = foreign.id
+        other_final = Asset(
+            project_id=other_project.id,
+            kind="FINAL_VIDEO",
+            path=str(foreign_video_path),
+            mime_type="video/mp4",
+        )
+        session.add(other_final)
+        session.flush()
+        other_final_id = other_final.id
+
+    with pytest.raises(ValueError, match="belong"):
+        service.mux_shots(first["project_id"])
+    with session_scope(first["database"]) as session:
+        session.get(Shot, first["shot_ids"][0]).video_asset_id = original_video_id
+
+    muxed = service.mux_shots(first["project_id"])["muxed_paths"]
+    with pytest.raises(ValueError, match="project output"):
+        service.concat_project(first["project_id"], [second["source_videos"][0]])
+    with pytest.raises(ValueError, match="belong"):
+        service.export_manifest(first["project_id"], other_final_id)
+    assert muxed
