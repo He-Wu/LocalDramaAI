@@ -49,6 +49,13 @@ class PipelineState:
             raise ValueError(f"stage not initialized: {stage.value}")
         return row
 
+    def _stages(self, session: Session) -> list[JobStage]:
+        return list(
+            session.scalars(
+                select(JobStage).where(JobStage.job_id == self.job_id)
+            )
+        )
+
     @staticmethod
     def _require_status(
         row: JobStage,
@@ -68,6 +75,20 @@ class PipelineState:
     ) -> None:
         if job.status not in allowed:
             raise ValueError(f"cannot {operation} job {job.id} from {job.status}")
+
+    @staticmethod
+    def _require_current_stage(job: GenerationJob, stage: PipelineStage) -> None:
+        if job.current_stage != stage.value:
+            raise ValueError(f"stage {stage.value} is not the current stage")
+
+    @staticmethod
+    def _require_completed_prefix(rows: list[JobStage], index: int) -> None:
+        if any(
+            PIPELINE_STAGES.index(row.stage) < index
+            and row.status != StageStatus.COMPLETED
+            for row in rows
+        ):
+            raise ValueError("preceding stages must be completed")
 
     def _event(
         self,
@@ -125,8 +146,19 @@ class PipelineState:
                     JobStatus.RUNNING,
                 ),
             )
-            row = self._stage(session, stage)
+            if job.cancel_requested_at is not None:
+                raise ValueError("cannot start stage while cancellation is requested")
+            rows = self._stages(session)
+            row = next((item for item in rows if item.stage == stage), None)
+            if row is None:
+                raise ValueError(f"stage not initialized: {stage.value}")
             self._require_status(row, "start", (StageStatus.PENDING,))
+            self._require_completed_prefix(rows, index)
+            if any(
+                item.id != row.id and item.status == StageStatus.RUNNING
+                for item in rows
+            ):
+                raise ValueError("another stage is already running")
             row.status = StageStatus.RUNNING
             row.attempt += 1
             row.input_json = input_json
@@ -136,7 +168,7 @@ class PipelineState:
             row.completed_at = None
             job.status = JobStatus.RUNNING
             job.current_stage = stage.value
-            job.progress = index / len(PIPELINE_STAGES)
+            job.progress = max(job.progress, index / len(PIPELINE_STAGES))
             self._event(
                 session,
                 "stage_started",
@@ -152,10 +184,11 @@ class PipelineState:
             self._require_job_status(job, "complete", (JobStatus.RUNNING,))
             row = self._stage(session, stage)
             self._require_status(row, "complete", (StageStatus.RUNNING,))
+            self._require_current_stage(job, stage)
             row.status = StageStatus.COMPLETED
             row.output_json = output_json
             row.completed_at = datetime.now(timezone.utc)
-            job.progress = (index + 1) / len(PIPELINE_STAGES)
+            job.progress = max(job.progress, (index + 1) / len(PIPELINE_STAGES))
             self._event(
                 session,
                 "stage_completed",
@@ -171,6 +204,7 @@ class PipelineState:
             self._require_job_status(job, "fail", (JobStatus.RUNNING,))
             row = self._stage(session, stage)
             self._require_status(row, "fail", (StageStatus.RUNNING,))
+            self._require_current_stage(job, stage)
             row.status = StageStatus.FAILED
             row.error_code = code
             row.error_message = message
@@ -199,6 +233,21 @@ class PipelineState:
                 status != StageStatus.COMPLETED for status in statuses
             ):
                 raise ValueError("cannot finish pipeline before all stages are completed")
+            if job.cancel_requested_at is not None:
+                final_stage = PIPELINE_STAGES[-1]
+                job.status = JobStatus.CANCELLED
+                job.progress = 1.0
+                job.current_stage = final_stage.value
+                job.output_json = None
+                job.completed_at = datetime.now(timezone.utc)
+                self._event(
+                    session,
+                    "cancelled",
+                    1.0,
+                    "Cancelled before pipeline completion",
+                    {"stage": final_stage.value},
+                )
+                return
             job.status = JobStatus.COMPLETED
             job.progress = 1.0
             job.current_stage = "complete"
@@ -209,6 +258,8 @@ class PipelineState:
     def request_cancel(self) -> None:
         with self._write_session() as session:
             job = self._job(session)
+            if job.cancel_requested_at is not None:
+                return
             self._require_job_status(
                 job,
                 "request cancellation for",
@@ -233,7 +284,7 @@ class PipelineState:
             return job.cancel_requested_at is not None
 
     def mark_cancelled(self, stage: PipelineStage) -> None:
-        self._stage_index(stage)
+        index = self._stage_index(stage)
         with self._write_session() as session:
             job = self._job(session)
             self._require_job_status(
@@ -246,16 +297,27 @@ class PipelineState:
                     JobStatus.INTERRUPTED,
                 ),
             )
-            row = self._stage(session, stage)
+            rows = self._stages(session)
+            row = next((item for item in rows if item.stage == stage), None)
+            if row is None:
+                raise ValueError(f"stage not initialized: {stage.value}")
             self._require_status(
                 row,
                 "cancel",
                 (StageStatus.PENDING, StageStatus.RUNNING),
             )
+            if row.status == StageStatus.RUNNING:
+                self._require_current_stage(job, stage)
+            else:
+                self._require_completed_prefix(rows, index)
+                if any(item.status == StageStatus.RUNNING for item in rows):
+                    raise ValueError("another stage is already running")
             completed_at = datetime.now(timezone.utc)
             row.status = StageStatus.CANCELLED
             row.completed_at = completed_at
             job.status = JobStatus.CANCELLED
+            job.current_stage = stage.value
+            job.progress = max(job.progress, index / len(PIPELINE_STAGES))
             job.completed_at = completed_at
             self._event(
                 session,
@@ -277,19 +339,15 @@ class PipelineState:
                     JobStatus.CANCELLED,
                 ),
             )
-            rows = list(
-                session.scalars(
-                    select(JobStage).where(JobStage.job_id == self.job_id)
-                )
-            )
+            rows = self._stages(session)
             if not any(row.stage == stage for row in rows):
                 raise ValueError(f"stage not initialized: {stage.value}")
-            if any(
-                PIPELINE_STAGES.index(row.stage) < start
-                and row.status != StageStatus.COMPLETED
-                for row in rows
-            ):
-                raise ValueError("preceding stages must be completed before retry")
+            try:
+                self._require_completed_prefix(rows, start)
+            except ValueError as exc:
+                raise ValueError(
+                    "preceding stages must be completed before retry"
+                ) from exc
             for row in rows:
                 if PIPELINE_STAGES.index(row.stage) >= start:
                     row.status = StageStatus.PENDING
@@ -300,7 +358,7 @@ class PipelineState:
                     row.completed_at = None
             job.status = JobStatus.QUEUED
             job.current_stage = stage.value
-            job.progress = start / len(PIPELINE_STAGES)
+            job.progress = max(job.progress, start / len(PIPELINE_STAGES))
             job.error_code = None
             job.error_message = None
             job.cancel_requested_at = None
