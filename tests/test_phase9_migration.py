@@ -1,9 +1,12 @@
+import importlib
 import sqlite3
 from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import create_engine, inspect, text
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
+from sqlalchemy import create_engine, event, inspect, text
 
 from app.db.session import create_schema, initialize_database, session_scope
 from app.models import Project
@@ -56,6 +59,13 @@ def _create_phase8_database(database: Path) -> None:
                 FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE scenes (
+                id VARCHAR(36) NOT NULL PRIMARY KEY,
+                project_id VARCHAR(36) NOT NULL,
+                title VARCHAR(200) NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE alembic_version (
                 version_num VARCHAR(32) NOT NULL PRIMARY KEY
             );
@@ -75,6 +85,7 @@ def _create_phase8_database(database: Path) -> None:
                 'video/mp4', NULL,
                 '2026-08-11 00:00:00', '2026-08-11 00:00:00'
             );
+            INSERT INTO scenes VALUES ('scene-1', 'project-1', 'Opening');
             INSERT INTO alembic_version VALUES ('{PHASE8_REVISION}');
             """
         )
@@ -87,6 +98,43 @@ def _project_output_foreign_keys(inspector):
         if foreign_key["constrained_columns"]
         in (["subtitle_asset_id"], ["final_video_asset_id"])
     }
+
+
+def _run_phase9_revision_with_foreign_keys(database: Path, direction: str):
+    engine = create_engine(f"sqlite:///{database.as_posix()}")
+
+    @event.listens_for(engine, "connect")
+    def enable_foreign_keys(dbapi_connection, _):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    migration = importlib.import_module(
+        "migrations.versions.0002_phase9_project_outputs"
+    )
+    try:
+        with engine.connect() as connection:
+            assert connection.execute(text("PRAGMA foreign_keys")).scalar_one() == 1
+            context = MigrationContext.configure(
+                connection,
+                opts={"render_as_batch": True},
+            )
+            with Operations.context(context):
+                getattr(migration, direction)()
+            assert connection.execute(text("PRAGMA foreign_keys")).scalar_one() == 1
+            return {
+                "projects": connection.execute(
+                    text("SELECT id, name FROM projects")
+                ).all(),
+                "assets": connection.execute(
+                    text("SELECT id, project_id FROM assets ORDER BY id")
+                ).all(),
+                "scenes": connection.execute(
+                    text("SELECT id, project_id FROM scenes")
+                ).all(),
+            }
+    finally:
+        engine.dispose()
 
 
 def _assert_phase9_project_schema(database: Path) -> None:
@@ -170,6 +218,22 @@ def test_literal_phase8_database_upgrades_without_losing_project_or_assets(tmp_p
         ("subtitle-asset-1", "project-1", "subtitle", "/subtitle.srt"),
         ("video-asset-1", "project-1", "video", "/final.mp4"),
     ]
+
+
+def test_batch_recreate_preserves_dependent_rows_with_foreign_keys_enabled(tmp_path):
+    database = tmp_path / "foreign-keys-enabled.db"
+    _create_phase8_database(database)
+
+    expected_rows = {
+        "projects": [("project-1", "Phase 8 project")],
+        "assets": [
+            ("subtitle-asset-1", "project-1"),
+            ("video-asset-1", "project-1"),
+        ],
+        "scenes": [("scene-1", "project-1")],
+    }
+    assert _run_phase9_revision_with_foreign_keys(database, "upgrade") == expected_rows
+    assert _run_phase9_revision_with_foreign_keys(database, "downgrade") == expected_rows
 
 
 def test_initialize_database_is_idempotent_after_create_all(tmp_path):
