@@ -11,8 +11,8 @@
 
 ## Phase 9 accepted evidence
 
-- Run ID: `20260812-final-v2`
-- Canonical output: `E:\kang\github\Movie\artifacts\phase9\20260812-final-v2\storage\projects\55fe0eab-646a-405b-9f1f-37a635997bd6\output\final.mp4`
+- Run ID: `20260812-final-v3`
+- Canonical output: `E:\kang\github\Movie\artifacts\phase9\20260812-final-v3\storage\projects\7700eb1d-9798-4960-9f13-c79ca30b2dba\output\final.mp4`
 - Output SHA256: `b5c2bb824e8485530191ec4daed59b80d8855c415678424a31f8558f9a7a0a45`
 - Media: 640x368, 145 frames at 25 FPS, H.264/yuv420p + AAC stereo 48 kHz, 5.8 seconds
 - Subtitle: one UTF-8 Chinese cue from 0.000 to 2.480 seconds; SHA256 `6bf1a9593614ea9dba466b055f457eb3533e9497e7ab3ab4d851b0782194f828`

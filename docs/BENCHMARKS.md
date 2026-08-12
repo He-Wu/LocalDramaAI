@@ -62,6 +62,6 @@ Start/middle/end frames and the mouth contact sheet were visually approved: mout
 
 | Pipeline | Input Shots | Output profile | Render elapsed | Process RSS peak | System RAM peak | Windows commit peak | Result |
 |---|---:|---|---:|---:|---:|---:|---|
-| Deterministic SRT + FFmpeg final render | 2 | 640x368, 145 frames, 25 FPS, H.264/yuv420p + AAC stereo 48 kHz | 2.611 s | 56.5 MiB | 21,051 MiB | 27,471 MiB | READY |
+| Deterministic SRT + FFmpeg final render | 2 | 640x368, 145 frames, 25 FPS, H.264/yuv420p + AAC stereo 48 kHz | 2.566 s | 57.0 MiB | 21,197 MiB | 27,169 MiB | READY |
 
 The manually seeded smoke consumes the locked Phase 8 LIPSYNC, Phase 7 Dialogue WAV, and Phase 5 VIDEO. Output duration is exactly 5.8 seconds for video and audio; immutable output and canonical alias share SHA256 `b5c2bb824e8485530191ec4daed59b80d8855c415678424a31f8558f9a7a0a45`. Strict full decode, 145-frame count, database pointers, Assets, ordered manifests, SRT bytes, provider manifest, runtime/font identity, temp/process cleanup, and alias equality passed. Visual review approved readable Chinese glyphs within the safe margin, subtitle absence after the cue, undistorted framing, and a clean non-black transition.
