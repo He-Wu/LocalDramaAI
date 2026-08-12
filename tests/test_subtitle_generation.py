@@ -18,7 +18,11 @@ from app.services.subtitle_generation import (
 )
 
 
-def _timeline_with_dialogues(*dialogues: TimelineDialogue) -> RenderTimeline:
+def _timeline_with_dialogues(
+    *dialogues: TimelineDialogue,
+    total_frames: int = 250,
+    fps: int = 25,
+) -> RenderTimeline:
     shot = TimelineShot(
         shot_id="shot-1",
         scene_id="scene-1",
@@ -39,17 +43,17 @@ def _timeline_with_dialogues(*dialogues: TimelineDialogue) -> RenderTimeline:
         video_size=1,
         video_sha256="0" * 64,
         start_frame=0,
-        frame_count=250,
+        frame_count=total_frames,
         dialogues=tuple(dialogues),
     )
     return RenderTimeline(
         project_id="project-1",
         subtitle_asset_id=None,
         final_video_asset_id=None,
-        profile=RenderProfile(),
+        profile=RenderProfile(fps=fps),
         scenes=(),
         shots=(shot,),
-        total_frames=250,
+        total_frames=total_frames,
         canonical_json="{}",
         workflow_hash="0" * 64,
     )
@@ -138,6 +142,48 @@ def test_serialize_srt_empty_cues_is_empty_bytes():
     assert serialize_srt(()) == b""
 
 
+@pytest.mark.parametrize("indices", ((2,), (1, 3), (1, 1)))
+def test_serialize_srt_rejects_nonsequential_indices(indices):
+    cues = tuple(
+        SubtitleCue(index, offset * 1_000, (offset + 1) * 1_000, "字幕")
+        for offset, index in enumerate(indices)
+    )
+
+    with pytest.raises(ValueError, match="Subtitle cue indices must be sequential"):
+        serialize_srt(cues)
+
+
+@pytest.mark.parametrize(
+    ("start_ms", "end_ms"),
+    ((-1, 1), (0, 0), (1, 0)),
+)
+def test_serialize_srt_rejects_invalid_cue_intervals(start_ms, end_ms):
+    cue = SubtitleCue(1, start_ms, end_ms, "非法区间")
+
+    with pytest.raises(ValueError, match="Subtitle cue interval is invalid"):
+        serialize_srt((cue,))
+
+
+def test_serialize_srt_rejects_cues_out_of_time_order():
+    cues = (
+        SubtitleCue(1, 1_000, 2_000, "第二句"),
+        SubtitleCue(2, 0, 500, "第一句"),
+    )
+
+    with pytest.raises(ValueError, match="Subtitle cues must be ordered by time"):
+        serialize_srt(cues)
+
+
+def test_serialize_srt_rejects_overlapping_cues():
+    cues = (
+        SubtitleCue(1, 0, 1_500, "第一句"),
+        SubtitleCue(2, 1_000, 2_000, "第二句"),
+    )
+
+    with pytest.raises(ValueError, match="Subtitle cues must not overlap"):
+        serialize_srt(cues)
+
+
 def test_cues_from_timeline_allows_a_shot_without_dialogue():
     assert cues_from_timeline(_timeline_with_dialogues()) == ()
 
@@ -172,6 +218,34 @@ def test_cues_from_timeline_rejects_overlapping_dialogues():
 
     with pytest.raises(ValueError, match="Subtitle cues must not overlap"):
         cues_from_timeline(timeline)
+
+
+@pytest.mark.parametrize(
+    ("start_ms", "end_ms"),
+    ((-1, 1), (0, 0), (1, 0)),
+)
+def test_cues_from_timeline_rejects_invalid_cue_intervals(start_ms, end_ms):
+    timeline = _timeline_with_dialogues(
+        _dialogue(0, "非法区间", start_ms, end_ms)
+    )
+
+    with pytest.raises(ValueError, match="Subtitle cue interval is invalid"):
+        cues_from_timeline(timeline)
+
+
+def test_cues_from_timeline_uses_half_up_frame_duration_boundary():
+    at_boundary = _timeline_with_dialogues(
+        _dialogue(0, "合法边界", 0, 63), total_frames=1, fps=16
+    )
+    past_boundary = _timeline_with_dialogues(
+        _dialogue(0, "越界", 0, 64), total_frames=1, fps=16
+    )
+
+    assert cues_from_timeline(at_boundary) == (
+        SubtitleCue(1, 0, 63, "合法边界"),
+    )
+    with pytest.raises(ValueError, match="Subtitle cue exceeds timeline duration"):
+        cues_from_timeline(past_boundary)
 
 
 def test_write_subtitle_atomic_uses_unique_same_directory_temps_and_replace(

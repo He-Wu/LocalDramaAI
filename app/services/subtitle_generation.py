@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import tempfile
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
 from app.services.render_timeline import RenderTimeline
@@ -18,12 +19,24 @@ class SubtitleCue:
     text: str
 
 
+def _validate_interval(start_ms: int, end_ms: int) -> None:
+    if start_ms < 0 or end_ms <= start_ms:
+        raise ValueError("Subtitle cue interval is invalid")
+
+
 def cues_from_timeline(timeline: RenderTimeline) -> tuple[SubtitleCue, ...]:
     cues: list[SubtitleCue] = []
     previous_start = -1
     previous_end = 0
+    timeline_end_ms = int(
+        (Decimal(timeline.total_frames) * 1000 / Decimal(timeline.profile.fps))
+        .to_integral_value(rounding=ROUND_HALF_UP)
+    )
     for shot in timeline.shots:
         for dialogue in shot.dialogues:
+            _validate_interval(dialogue.start_ms, dialogue.end_ms)
+            if dialogue.end_ms > timeline_end_ms:
+                raise ValueError("Subtitle cue exceeds timeline duration")
             if dialogue.start_ms < previous_start:
                 raise ValueError("Subtitle cues must be ordered by time")
             if cues and dialogue.start_ms < previous_end:
@@ -68,6 +81,18 @@ def format_srt_timestamp(milliseconds: int) -> str:
 
 
 def serialize_srt(cues: tuple[SubtitleCue, ...]) -> bytes:
+    previous_start = -1
+    previous_end = 0
+    for expected_index, cue in enumerate(cues, start=1):
+        if cue.index != expected_index:
+            raise ValueError("Subtitle cue indices must be sequential")
+        _validate_interval(cue.start_ms, cue.end_ms)
+        if cue.start_ms < previous_start:
+            raise ValueError("Subtitle cues must be ordered by time")
+        if expected_index > 1 and cue.start_ms < previous_end:
+            raise ValueError("Subtitle cues must not overlap")
+        previous_start = cue.start_ms
+        previous_end = cue.end_ms
     blocks = [
         (
             f"{cue.index}\r\n"
