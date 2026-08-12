@@ -19,6 +19,9 @@ from app.services.audio_probe import probe_wav
 from app.services.video_probe import probe_video
 
 
+_WAV_VALIDATION_BLOCK_BYTES = 64 * 1024
+
+
 @dataclass(frozen=True)
 class RenderProfile:
     width: int = 640
@@ -188,11 +191,16 @@ def _validate_wav_payload(
     sample_width: int,
 ) -> None:
     frame_size = channels * sample_width
+    if frame_size > _WAV_VALIDATION_BLOCK_BYTES:
+        raise ValueError(
+            f"WAV frame size exceeds validation byte budget: {path}"
+        )
+    frames_per_chunk = _WAV_VALIDATION_BLOCK_BYTES // frame_size
     remaining_frames = frames
     try:
         with wave.open(str(path), "rb") as source:
             while remaining_frames:
-                requested_frames = min(remaining_frames, 16_384)
+                requested_frames = min(remaining_frames, frames_per_chunk)
                 payload = source.readframes(requested_frames)
                 if len(payload) != requested_frames * frame_size:
                     raise ValueError(f"WAV has a truncated PCM payload: {path}")

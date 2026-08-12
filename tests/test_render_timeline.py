@@ -526,12 +526,35 @@ def test_wav_payload_validation_never_requests_unbounded_declared_frames(
         render_timeline._validate_wav_payload(
             tmp_path / "huge-declaration.wav",
             frames=1_073_741_823,
-            channels=2,
-            sample_width=2,
+            channels=8,
+            sample_width=8,
         )
 
     assert requested_frames
-    assert max(requested_frames) <= 16_384
+    assert max(requested_frames) * 8 * 8 <= 64 * 1024
+
+
+def test_wav_payload_validation_rejects_single_frame_over_byte_budget(
+    tmp_path, monkeypatch
+):
+    opened = False
+
+    def unexpected_open(*_args, **_kwargs):
+        nonlocal opened
+        opened = True
+        raise AssertionError("unsafe WAV must be rejected before opening payload")
+
+    monkeypatch.setattr(render_timeline.wave, "open", unexpected_open)
+
+    with pytest.raises(ValueError, match="frame size exceeds validation byte budget"):
+        render_timeline._validate_wav_payload(
+            tmp_path / "huge-frame.wav",
+            frames=1,
+            channels=1_000_000,
+            sample_width=10_000,
+        )
+
+    assert opened is False
 
 
 def test_timeline_rejects_projects_without_shots(seed_project):
