@@ -10,6 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from sqlalchemy.orm import Session
 
 from app.db.session import create_schema, session_scope
 from app.models import Asset, Dialogue, GenerationManifest, Project, Scene, Shot
@@ -33,6 +34,16 @@ from app.services.video_probe import VideoInfo
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _generation_artifacts(seed_project: SeedProject) -> set[Path]:
+    project_root = seed_project.storage / "projects" / seed_project.project_id
+    return {
+        path.relative_to(project_root)
+        for directory in ("subtitles", "render", "manifests")
+        for path in (project_root / directory).glob("*")
+        if path.is_file()
+    }
 
 
 @dataclass(frozen=True)
@@ -386,6 +397,7 @@ def test_provider_manifest_mismatch_is_precommit_failure(
         assert project.subtitle_asset_id is None
         assert project.final_video_asset_id is None
         assert session.query(GenerationManifest).count() == 0
+    assert _generation_artifacts(seed_project) == set()
 
 
 def test_stale_recheck_failure_preserves_project_pointers(
@@ -409,6 +421,145 @@ def test_stale_recheck_failure_preserves_project_pointers(
         project = session.get(Project, seed_project.project_id)
         assert project.subtitle_asset_id is None
         assert project.final_video_asset_id is None
+    assert _generation_artifacts(seed_project) == set()
+
+
+def test_database_flush_failure_rolls_back_and_cleans_generation_artifacts(
+    seed_project: SeedProject,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_flush = Session.flush
+
+    def fail_output_flush(session, *args, **kwargs):
+        if any(
+            isinstance(item, Asset) and item.kind == "FINAL_VIDEO"
+            for item in session.new
+        ):
+            raise RuntimeError("injected output flush failure")
+        return original_flush(session, *args, **kwargs)
+
+    monkeypatch.setattr(Session, "flush", fail_output_flush)
+
+    with pytest.raises(RuntimeError, match="output flush failure"):
+        render_project(
+            seed_project.database,
+            seed_project.project_id,
+            DeterministicProvider(),
+            seed_project.storage,
+        )
+
+    assert _generation_artifacts(seed_project) == set()
+    with session_scope(seed_project.database) as session:
+        project = session.get(Project, seed_project.project_id)
+        assert project.subtitle_asset_id is None
+        assert project.final_video_asset_id is None
+        assert session.query(GenerationManifest).count() == 0
+
+
+def test_database_commit_failure_rolls_back_and_cleans_generation_artifacts(
+    seed_project: SeedProject,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_commit = Session.commit
+
+    def fail_output_commit(session):
+        if any(
+            isinstance(item, GenerationManifest)
+            and item.workflow_name == "final_render_v1"
+            for item in session.new
+        ):
+            raise RuntimeError("injected output commit failure")
+        return original_commit(session)
+
+    monkeypatch.setattr(Session, "commit", fail_output_commit)
+
+    with pytest.raises(RuntimeError, match="output commit failure"):
+        render_project(
+            seed_project.database,
+            seed_project.project_id,
+            DeterministicProvider(),
+            seed_project.storage,
+        )
+
+    assert _generation_artifacts(seed_project) == set()
+    with session_scope(seed_project.database) as session:
+        project = session.get(Project, seed_project.project_id)
+        assert project.subtitle_asset_id is None
+        assert project.final_video_asset_id is None
+        assert session.query(GenerationManifest).count() == 0
+
+
+def test_database_precommit_failure_preserves_previous_pointers_and_alias(
+    seed_project: SeedProject,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = render_project(
+        seed_project.database,
+        seed_project.project_id,
+        DeterministicProvider(b"accepted-final"),
+        seed_project.storage,
+    )
+    accepted_artifacts = _generation_artifacts(seed_project)
+    accepted_alias = first.published_path.read_bytes()
+    original_flush = Session.flush
+
+    def fail_output_flush(session, *args, **kwargs):
+        if any(
+            isinstance(item, Asset) and item.kind == "FINAL_VIDEO"
+            for item in session.new
+        ):
+            raise RuntimeError("injected replacement flush failure")
+        return original_flush(session, *args, **kwargs)
+
+    monkeypatch.setattr(Session, "flush", fail_output_flush)
+
+    with pytest.raises(RuntimeError, match="replacement flush failure"):
+        render_project(
+            seed_project.database,
+            seed_project.project_id,
+            DeterministicProvider(b"rejected-final"),
+            seed_project.storage,
+        )
+
+    assert _generation_artifacts(seed_project) == accepted_artifacts
+    assert first.published_path.read_bytes() == accepted_alias
+    with session_scope(seed_project.database) as session:
+        project = session.get(Project, seed_project.project_id)
+        assert project.subtitle_asset_id == first.subtitle_asset.id
+        assert project.final_video_asset_id == first.final_asset.id
+
+
+def test_precommit_cleanup_failure_preserves_primary_error_and_adds_note(
+    seed_project: SeedProject,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_unlink = Path.unlink
+
+    class FailingProvider:
+        def render(self, _timeline, _srt, output_path, _manifest_path):
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(output_path).write_bytes(b"partial rejected bytes")
+            raise RuntimeError("primary provider failure")
+
+    def fail_subtitle_cleanup(path, *args, **kwargs):
+        if path.parent.name == "subtitles":
+            raise RuntimeError("cleanup disk failure")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_subtitle_cleanup)
+
+    with pytest.raises(RuntimeError, match="primary provider failure") as raised:
+        render_project(
+            seed_project.database,
+            seed_project.project_id,
+            FailingProvider(),
+            seed_project.storage,
+        )
+
+    assert any("cleanup disk failure" in note for note in raised.value.__notes__)
+    project_root = seed_project.storage / "projects" / seed_project.project_id
+    assert not list((project_root / "render").glob("*"))
+    assert not list((project_root / "manifests").glob("*"))
 
 
 def test_alias_failure_after_commit_returns_degraded_authoritative_result(
@@ -433,6 +584,19 @@ def test_alias_failure_after_commit_returns_degraded_authoritative_result(
     assert result.alias_status == "DEGRADED"
     assert "alias disk failure" in result.alias_error
     assert Path(result.final_asset.path).is_file()
+    assert result.subtitle_path.is_file()
+    assert result.provider_result.manifest_path.is_file()
+    assert _generation_artifacts(seed_project) == {
+        result.subtitle_path.relative_to(
+            seed_project.storage / "projects" / seed_project.project_id
+        ),
+        Path(result.final_asset.path).relative_to(
+            seed_project.storage / "projects" / seed_project.project_id
+        ),
+        result.provider_result.manifest_path.relative_to(
+            seed_project.storage / "projects" / seed_project.project_id
+        ),
+    }
     assert not result.published_path.exists()
     with session_scope(seed_project.database) as session:
         project = session.get(Project, seed_project.project_id)
@@ -546,6 +710,17 @@ def test_two_concurrent_renders_commit_exactly_one_coherent_winner(
         assert project.subtitle_asset_id == winners[0].subtitle_asset.id
         assert project.final_video_asset_id == winners[0].final_asset.id
     assert _sha256(winners[0].published_path) == _sha256(Path(winners[0].final_asset.path))
+    assert _generation_artifacts(seed_project) == {
+        Path(winners[0].subtitle_asset.path).relative_to(
+            seed_project.storage / "projects" / seed_project.project_id
+        ),
+        Path(winners[0].final_asset.path).relative_to(
+            seed_project.storage / "projects" / seed_project.project_id
+        ),
+        winners[0].provider_result.manifest_path.relative_to(
+            seed_project.storage / "projects" / seed_project.project_id
+        ),
+    }
 
 
 def test_reconciliation_rejects_authoritative_asset_metadata_hash_mismatch(
@@ -666,6 +841,12 @@ def test_provider_failure_preserves_previously_accepted_output(
         seed_project.storage,
     )
     accepted_alias = first.published_path.read_bytes()
+    project_root = seed_project.storage / "projects" / seed_project.project_id
+    accepted_files = {
+        path.relative_to(project_root)
+        for path in project_root.rglob("*")
+        if path.is_file()
+    }
 
     class FailingProvider:
         def render(self, _timeline, _srt, output_path, _manifest_path):
@@ -682,6 +863,11 @@ def test_provider_failure_preserves_previously_accepted_output(
         )
 
     assert first.published_path.read_bytes() == accepted_alias
+    assert {
+        path.relative_to(project_root)
+        for path in project_root.rglob("*")
+        if path.is_file()
+    } == accepted_files
     with session_scope(seed_project.database) as session:
         project = session.get(Project, seed_project.project_id)
         assert project.subtitle_asset_id == first.subtitle_asset.id

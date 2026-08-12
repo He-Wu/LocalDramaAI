@@ -50,6 +50,18 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _cleanup_generation_artifacts(
+    paths: tuple[Path, ...], primary_error: BaseException
+) -> None:
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except BaseException as cleanup_error:
+            primary_error.add_note(
+                f"failed to clean generation artifact {path}: {cleanup_error!r}"
+            )
+
+
 def _try_lock(file) -> bool:
     file.seek(0)
     if os.name == "nt":
@@ -198,21 +210,30 @@ def render_project(
     manifest_path = project_root / "manifests" / f"{generation_id}.json"
     alias_path = project_root / "output" / "final.mp4"
     subtitle_path.parent.mkdir(parents=True, exist_ok=True)
-    write_subtitle_atomic(subtitle_path, srt)
-    provider_result = provider.render(timeline, srt, output_path, manifest_path)
+    generation_paths = (subtitle_path, output_path, manifest_path)
     try:
-        persisted_srt = subtitle_path.read_bytes()
-    except OSError as exc:
-        raise RuntimeError("persisted subtitle bytes mismatch") from exc
-    if persisted_srt != srt:
-        raise RuntimeError("persisted subtitle bytes mismatch")
-    if provider_result.output_path.resolve() != output_path.resolve():
-        raise RuntimeError("FFmpeg provider returned an unexpected output path")
-    if provider_result.manifest_path.resolve() != manifest_path.resolve():
-        raise RuntimeError("FFmpeg provider returned an unexpected manifest path")
-    if not output_path.is_file() or _sha256(output_path) != provider_result.output_sha256:
-        raise RuntimeError("FFmpeg provider output hash mismatch")
-    provider_payload = _provider_manifest(provider_result, timeline, srt)
+        write_subtitle_atomic(subtitle_path, srt)
+        provider_result = provider.render(timeline, srt, output_path, manifest_path)
+    except BaseException as primary_error:
+        _cleanup_generation_artifacts(generation_paths, primary_error)
+        raise
+    try:
+        try:
+            persisted_srt = subtitle_path.read_bytes()
+        except OSError as exc:
+            raise RuntimeError("persisted subtitle bytes mismatch") from exc
+        if persisted_srt != srt:
+            raise RuntimeError("persisted subtitle bytes mismatch")
+        if provider_result.output_path.resolve() != output_path.resolve():
+            raise RuntimeError("FFmpeg provider returned an unexpected output path")
+        if provider_result.manifest_path.resolve() != manifest_path.resolve():
+            raise RuntimeError("FFmpeg provider returned an unexpected manifest path")
+        if not output_path.is_file() or _sha256(output_path) != provider_result.output_sha256:
+            raise RuntimeError("FFmpeg provider output hash mismatch")
+        provider_payload = _provider_manifest(provider_result, timeline, srt)
+    except BaseException as primary_error:
+        _cleanup_generation_artifacts(generation_paths, primary_error)
+        raise
 
     subtitle_id = str(uuid.uuid4())
     final_id = str(uuid.uuid4())
@@ -306,63 +327,70 @@ def render_project(
         final_inputs.append(subtitle_id)
 
     lock_path = project_root / ".phase9-publish.lock"
-    with _project_lock(lock_path):
-        _reconcile_current_alias(database_url, project_id, alias_path)
-        session = sessionmaker(
-            bind=get_engine(database_url), expire_on_commit=False, future=True
-        )()
-        try:
-            assert_render_timeline_unchanged(session, timeline)
-            project = session.get(Project, project_id)
-            if project is None:
-                raise RuntimeError("project timeline changed during Phase 9 render")
-            session.add_all([subtitle_asset, final_asset])
-            session.flush()
-            session.add_all(
-                [
-                    GenerationManifest(
-                        asset_id=subtitle_id,
-                        provider="local",
-                        provider_version="1",
-                        workflow_name="subtitle_srt_v1",
-                        workflow_hash=timeline.workflow_hash,
-                        generation_time=0.0,
-                        input_assets=subtitle_inputs,
-                        output_asset=subtitle_id,
-                    ),
-                    GenerationManifest(
-                        asset_id=final_id,
-                        provider="ffmpeg",
-                        provider_version=provider_result.identity.version,
-                        workflow_name="final_render_v1",
-                        workflow_hash=timeline.workflow_hash,
-                        generation_time=provider_result.generation_time,
-                        input_assets=final_inputs,
-                        output_asset=final_id,
-                    ),
-                ]
-            )
-            project.subtitle_asset_id = subtitle_id
-            project.final_video_asset_id = final_id
-            session.commit()
-        except Exception:
-            session.rollback()
-            raise
-        finally:
-            session.close()
+    committed = False
+    try:
+        with _project_lock(lock_path):
+            _reconcile_current_alias(database_url, project_id, alias_path)
+            session = sessionmaker(
+                bind=get_engine(database_url), expire_on_commit=False, future=True
+            )()
+            try:
+                assert_render_timeline_unchanged(session, timeline)
+                project = session.get(Project, project_id)
+                if project is None:
+                    raise RuntimeError("project timeline changed during Phase 9 render")
+                session.add_all([subtitle_asset, final_asset])
+                session.flush()
+                session.add_all(
+                    [
+                        GenerationManifest(
+                            asset_id=subtitle_id,
+                            provider="local",
+                            provider_version="1",
+                            workflow_name="subtitle_srt_v1",
+                            workflow_hash=timeline.workflow_hash,
+                            generation_time=0.0,
+                            input_assets=subtitle_inputs,
+                            output_asset=subtitle_id,
+                        ),
+                        GenerationManifest(
+                            asset_id=final_id,
+                            provider="ffmpeg",
+                            provider_version=provider_result.identity.version,
+                            workflow_name="final_render_v1",
+                            workflow_hash=timeline.workflow_hash,
+                            generation_time=provider_result.generation_time,
+                            input_assets=final_inputs,
+                            output_asset=final_id,
+                        ),
+                    ]
+                )
+                project.subtitle_asset_id = subtitle_id
+                project.final_video_asset_id = final_id
+                session.commit()
+                committed = True
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
 
-        try:
-            _atomic_alias(output_path, alias_path, provider_result.output_sha256)
-        except Exception as exc:
-            return RenderProjectResult(
-                subtitle_asset=subtitle_asset,
-                final_asset=final_asset,
-                subtitle_path=subtitle_path,
-                published_path=alias_path,
-                provider_result=provider_result,
-                alias_status="DEGRADED",
-                alias_error=str(exc),
-            )
+            try:
+                _atomic_alias(output_path, alias_path, provider_result.output_sha256)
+            except Exception as exc:
+                return RenderProjectResult(
+                    subtitle_asset=subtitle_asset,
+                    final_asset=final_asset,
+                    subtitle_path=subtitle_path,
+                    published_path=alias_path,
+                    provider_result=provider_result,
+                    alias_status="DEGRADED",
+                    alias_error=str(exc),
+                )
+    except BaseException as primary_error:
+        if not committed:
+            _cleanup_generation_artifacts(generation_paths, primary_error)
+        raise
     return RenderProjectResult(
         subtitle_asset=subtitle_asset,
         final_asset=final_asset,
