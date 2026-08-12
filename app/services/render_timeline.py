@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import wave
 from dataclasses import asdict, dataclass
 from decimal import Decimal, ROUND_CEILING, ROUND_HALF_UP
 from pathlib import Path
@@ -179,6 +180,23 @@ def _readable_nonempty_file(raw_path: str, label: str) -> tuple[Path, int]:
     return path, size
 
 
+def _validate_wav_payload(
+    path: Path,
+    *,
+    frames: int,
+    channels: int,
+    sample_width: int,
+) -> None:
+    expected_bytes = frames * channels * sample_width
+    try:
+        with wave.open(str(path), "rb") as source:
+            payload = source.readframes(frames)
+    except (EOFError, OSError, wave.Error) as exc:
+        raise ValueError(f"WAV has a truncated PCM payload: {path}") from exc
+    if len(payload) != expected_bytes:
+        raise ValueError(f"WAV has a truncated PCM payload: {path}")
+
+
 def build_render_timeline(database_url: str, project_id: str) -> RenderTimeline:
     """Snapshot one Project without holding a transaction during media probes."""
 
@@ -323,6 +341,13 @@ def build_render_timeline(database_url: str, project_id: str) -> RenderTimeline:
         ):
             raise ValueError(f"invalid video probe metadata: {video_path}")
         source_frame = Decimal(1) / source_fps
+        if video_info.frames is not None:
+            if video_info.frames <= 0:
+                raise ValueError(f"invalid video probe metadata: {video_path}")
+            source_duration = min(
+                source_duration,
+                Decimal(video_info.frames) / source_fps,
+            )
         if source_duration + source_frame < shot_duration:
             raise ValueError(
                 f"video source does not cover Shot editorial duration: {shot_id}"
@@ -357,6 +382,12 @@ def build_render_timeline(database_url: str, project_id: str) -> RenderTimeline:
             ) = _required_asset(asset_rows, audio_asset_id, project_id, "AUDIO")
             audio_path, audio_size = _readable_nonempty_file(audio_raw_path, "WAV")
             wav = probe_wav(audio_path)
+            _validate_wav_payload(
+                audio_path,
+                frames=wav.frames,
+                channels=wav.channels,
+                sample_width=wav.sample_width,
+            )
             measured_duration = Decimal(str(wav.duration))
             if abs(measured_duration - dialogue_duration) > Decimal("0.020"):
                 raise ValueError(
@@ -366,7 +397,7 @@ def build_render_timeline(database_url: str, project_id: str) -> RenderTimeline:
                 raise ValueError("Dialogue requires both start_time and end_time or neither")
             if persisted_start is None and persisted_end is None:
                 local_start = packed_start
-                local_end = local_start + dialogue_duration
+                local_end = local_start + measured_duration
             else:
                 local_start = _optional_time(persisted_start, "Dialogue start_time")
                 local_end = _optional_time(persisted_end, "Dialogue end_time")

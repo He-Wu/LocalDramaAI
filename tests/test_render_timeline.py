@@ -332,6 +332,20 @@ def test_timeline_rejects_video_shorter_than_editorial_duration(
         build_render_timeline(seed_project.database, seed_project.project_id)
 
 
+def test_timeline_uses_shorter_frame_count_when_video_metadata_conflicts(
+    seed_project, monkeypatch
+):
+    monkeypatch.setattr(
+        "app.services.render_timeline.probe_video",
+        lambda _path: VideoInfo(
+            codec="h264", width=640, height=368, fps=25.0, frames=1, duration=2.0
+        ),
+    )
+
+    with pytest.raises(ValueError, match="editorial duration"):
+        build_render_timeline(seed_project.database, seed_project.project_id)
+
+
 @pytest.mark.parametrize(
     ("fps", "duration"),
     [(float("nan"), 4.0), (25.0, float("inf"))],
@@ -376,6 +390,25 @@ def test_timeline_rejects_dialogue_overflow(seed_project):
 
     with pytest.raises(ValueError, match="Shot duration"):
         build_render_timeline(seed_project.database, seed_project.project_id)
+
+
+def test_untimed_dialogue_cue_uses_measured_wav_duration_within_tolerance(
+    seed_project,
+):
+    _write_wav(seed_project.audio_b_path, 0.510)
+    _update(
+        seed_project,
+        Dialogue,
+        "dialogue-b",
+        start_time=None,
+        end_time=None,
+    )
+
+    timeline = build_render_timeline(seed_project.database, seed_project.project_id)
+
+    dialogue = timeline.shots[1].dialogues[0]
+    assert dialogue.persisted_duration == 0.5
+    assert (dialogue.start_ms, dialogue.end_ms) == (1_000, 1_510)
 
 
 def test_timeline_rejects_overlapping_dialogues(seed_project):
@@ -455,6 +488,14 @@ def test_timeline_rejects_corrupt_wav(seed_project):
     seed_project.audio_a_path.write_bytes(b"not-a-wav")
 
     with pytest.raises(ValueError, match="Invalid WAV"):
+        build_render_timeline(seed_project.database, seed_project.project_id)
+
+
+def test_timeline_rejects_wav_with_truncated_declared_pcm_payload(seed_project):
+    wav_bytes = seed_project.audio_a_path.read_bytes()
+    seed_project.audio_a_path.write_bytes(wav_bytes[:-200])
+
+    with pytest.raises(ValueError, match="truncated PCM payload"):
         build_render_timeline(seed_project.database, seed_project.project_id)
 
 
