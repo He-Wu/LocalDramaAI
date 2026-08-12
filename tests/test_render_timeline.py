@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import select
 
 from app.db.session import create_schema, session_scope
 from app.models import Asset, Dialogue, Project, Scene, Shot
@@ -495,10 +495,27 @@ def test_stale_timeline_rejects_changed_input_bytes(seed_project):
         assert_render_timeline_unchanged(seed_project.database, timeline)
 
 
-def test_stale_timeline_can_share_callers_publication_transaction(seed_project):
+def test_stale_timeline_starts_immediate_caller_publication_transaction(seed_project):
     timeline = build_render_timeline(seed_project.database, seed_project.project_id)
 
     with session_scope(seed_project.database) as session:
-        session.execute(text("BEGIN IMMEDIATE"))
         assert_render_timeline_unchanged(session, timeline)
         assert session.in_transaction()
+
+
+def test_stale_timeline_rejects_caller_sqlite_transaction_autobegun_by_read(
+    seed_project,
+):
+    timeline = build_render_timeline(seed_project.database, seed_project.project_id)
+
+    with session_scope(seed_project.database) as session:
+        assert session.execute(
+            select(Project.id).where(Project.id == seed_project.project_id)
+        ).scalar_one() == seed_project.project_id
+        assert session.in_transaction()
+
+        with pytest.raises(
+            RuntimeError,
+            match="clean Session so it can start BEGIN IMMEDIATE",
+        ):
+            assert_render_timeline_unchanged(session, timeline)

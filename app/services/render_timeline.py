@@ -654,8 +654,12 @@ def assert_render_timeline_unchanged(
         engine = session.get_bind()
     try:
         if engine.dialect.name == "sqlite":
-            if not session.in_transaction():
-                session.execute(text("BEGIN IMMEDIATE"))
+            if not owns_session and session.in_transaction():
+                raise RuntimeError(
+                    "SQLite stale check requires a clean Session so it can start "
+                    "BEGIN IMMEDIATE"
+                )
+            session.execute(text("BEGIN IMMEDIATE"))
             lock_rows = False
         else:
             lock_rows = True
