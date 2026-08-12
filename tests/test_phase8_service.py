@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import io
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -358,6 +359,19 @@ class _FakeChild:
         self.returncode = -9
 
 
+class _FakeProcessOwner:
+    def __init__(self, *, stop_error=None):
+        self.stop_error = stop_error
+        self.stop_calls = []
+
+    def stop(self, child, timeout):
+        self.stop_calls.append((child, timeout))
+        if self.stop_error is not None:
+            raise self.stop_error
+        child.kill()
+        child.wait(timeout=timeout)
+
+
 def test_command_execution_uses_list_cwd_shell_false_and_bounded_log(tmp_path, monkeypatch):
     seen = {}
 
@@ -400,13 +414,16 @@ class _Cancelled(BaseException):
 
 def test_command_execution_kills_child_and_flushes_log_on_cancellation(tmp_path, monkeypatch):
     child = _FakeChild(output="last output", wait_error=_Cancelled())
+    owner = _FakeProcessOwner()
     monkeypatch.setattr(service, "_spawn_child", lambda *args, **kwargs: child)
+    monkeypatch.setattr(service, "_create_child_owner", lambda spawned: owner)
     log = tmp_path / "cancelled.log"
 
     with pytest.raises(_Cancelled):
         run_musetalk_command(["python"], cwd=tmp_path, timeout=2, log_path=log)
 
     assert child.killed is True
+    assert owner.stop_calls == [(child, service.CHILD_STOP_TIMEOUT_SECONDS)]
     assert log.read_text(encoding="utf-8") == "last output"
     assert service.active_child is None
 
@@ -430,6 +447,68 @@ def test_command_execution_rejects_child_failures(tmp_path, monkeypatch, mode):
     with pytest.raises(RuntimeError, match=message):
         run_musetalk_command(["python"], cwd=tmp_path, timeout=0.01, log_path=tmp_path / "run.log")
     assert service.active_child is None
+
+
+def test_command_execution_surfaces_owned_tree_cleanup_failure(tmp_path, monkeypatch):
+    child = _FakeChild(timeout=True)
+    owner = _FakeProcessOwner(stop_error=RuntimeError("owned process tree remains active"))
+    monkeypatch.setattr(service, "_spawn_child", lambda *args, **kwargs: child)
+    monkeypatch.setattr(service, "_create_child_owner", lambda spawned: owner)
+
+    with pytest.raises(RuntimeError, match="owned process tree remains active"):
+        run_musetalk_command(
+            ["python"], cwd=tmp_path, timeout=0.01, log_path=tmp_path / "failed.log"
+        )
+
+    assert owner.stop_calls == [(child, service.CHILD_STOP_TIMEOUT_SECONDS)]
+    assert service.active_child is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object integration")
+def test_timeout_terminates_owned_descendants_without_killing_unrelated_process(tmp_path):
+    parent_pid = tmp_path / "parent.pid"
+    child_pid = tmp_path / "child.pid"
+    grandchild_pid = tmp_path / "grandchild.pid"
+    unrelated = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"], shell=False
+    )
+    child_script = (
+        "import os,subprocess,sys,time;"
+        "open(sys.argv[1],'w').write(str(os.getpid()));"
+        "subprocess.Popen([sys.executable,'-c',"
+        "\"import os,sys,time;open(sys.argv[1],'w').write(str(os.getpid()));time.sleep(60)\","
+        "sys.argv[2]]);"
+        "time.sleep(60)"
+    )
+    parent_script = (
+        "import os,subprocess,sys,time;"
+        "open(sys.argv[1],'w').write(str(os.getpid()));"
+        "subprocess.Popen([sys.executable,'-c',sys.argv[2],sys.argv[3],sys.argv[4]]);"
+        "time.sleep(60)"
+    )
+    try:
+        with pytest.raises(RuntimeError, match="timed out"):
+            run_musetalk_command(
+                [
+                    sys.executable,
+                    "-c",
+                    parent_script,
+                    str(parent_pid),
+                    child_script,
+                    str(child_pid),
+                    str(grandchild_pid),
+                ],
+                cwd=tmp_path,
+                timeout=1.0,
+                log_path=tmp_path / "tree.log",
+            )
+
+        pids = [int(path.read_text()) for path in (parent_pid, child_pid, grandchild_pid)]
+        assert all(not service._windows_pid_is_active(pid) for pid in pids)
+        assert unrelated.poll() is None
+    finally:
+        unrelated.kill()
+        unrelated.wait(timeout=5)
 
 
 def test_real_ffmpeg_normalizes_video_and_pads_audio_exactly(tmp_path):
@@ -557,6 +636,60 @@ def test_happy_stub_creates_canonical_av_and_atomic_manifest(tmp_path):
     assert not list(settings.job_root.glob(".musetalk-job-*"))
     assert not list(Path(request.output_dir).glob("*.tmp.mp4"))
     assert not list(Path(request.output_dir).glob("*.tmp.json"))
+
+
+def test_generation_uses_staged_input_snapshot_after_caller_replaces_sources(
+    tmp_path, monkeypatch
+):
+    source_video = _video(tmp_path / "source.mp4")
+    source_audio = _audio(tmp_path / "source.wav")
+    expected_video_sha256 = _sha256(source_video)
+    expected_audio_sha256 = _sha256(source_audio)
+    request = _request(
+        tmp_path,
+        video_path=str(source_video.resolve()),
+        audio_path=str(source_audio.resolve()),
+    )
+    original_stage = service._stage_input
+    staged = []
+
+    def stage_and_replace(source, destination):
+        digest = original_stage(source, destination)
+        staged.append((Path(source), Path(destination), digest))
+        if len(staged) == 2:
+            source_video.write_bytes(b"replacement-video")
+            source_audio.write_bytes(b"replacement-audio")
+        return digest
+
+    monkeypatch.setattr(service, "_stage_input", stage_and_replace)
+
+    def fake_runner(command, **kwargs):
+        task_path = Path(command[command.index("--inference_config") + 1])
+        task = yaml.safe_load(task_path.read_text(encoding="utf-8"))["task_0"]
+        result_dir = Path(command[command.index("--result_dir") + 1])
+        upstream = expected_musetalk_output(result_dir)
+        upstream.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(task["video_path"], upstream)
+
+    settings = _settings(tmp_path)
+    response = run_generation(request, settings, command_runner=fake_runner)
+    manifest = json.loads(Path(response["manifest_path"]).read_text(encoding="utf-8"))
+
+    assert manifest["source_video"] == {
+        "path": str(source_video.resolve()),
+        "sha256": expected_video_sha256,
+    }
+    assert manifest["source_audio"] == {
+        "path": str(source_audio.resolve()),
+        "sha256": expected_audio_sha256,
+    }
+    assert _sha256(source_video) != expected_video_sha256
+    assert _sha256(source_audio) != expected_audio_sha256
+    assert [entry[2] for entry in staged] == [
+        expected_video_sha256,
+        expected_audio_sha256,
+    ]
+    assert not list(settings.job_root.glob(".musetalk-job-*"))
 
 
 def test_generation_passes_resolved_path_ffmpeg_parent_to_official_cli(tmp_path):

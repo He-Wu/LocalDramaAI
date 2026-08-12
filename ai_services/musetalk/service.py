@@ -9,11 +9,13 @@ manifest. The child process is the model lifetime boundary.
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import hashlib
 import json
 import math
 import os
 import re
+import signal
 import shutil
 import subprocess
 import tempfile
@@ -24,6 +26,8 @@ from dataclasses import asdict, dataclass
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable, Sequence
+
+from ctypes import wintypes
 
 import yaml
 from fastapi import FastAPI, HTTPException
@@ -46,6 +50,7 @@ DEFAULT_FFMPEG_BIN = Path("E:/LocalDramaAI/ffmpeg/bin")
 DEFAULT_JOB_ROOT = Path("E:/LocalDramaAI/musetalk-jobs")
 DEFAULT_TIMEOUT_SECONDS = 1800.0
 MAX_LOG_CHARS = 1_000_000
+CHILD_STOP_TIMEOUT_SECONDS = 10.0
 SHELL_SAFE_JOB_ROOT = re.compile(
     r"^[A-Za-z]:[\\/](?:[A-Za-z0-9_.-]+(?:[\\/]|$))+$"
 )
@@ -277,6 +282,232 @@ def _spawn_child(command: Sequence[str], **kwargs: Any) -> subprocess.Popen[str]
     return subprocess.Popen(command, **kwargs)
 
 
+class _DirectChildOwner:
+    """Last-resort owner used only when no OS process-tree primitive exists."""
+
+    def stop(self, child: Any, timeout: float) -> None:
+        try:
+            running = child.poll() is None
+        except Exception:
+            running = True
+        if running:
+            try:
+                child.kill()
+            except Exception as exc:
+                raise RuntimeError(f"failed to terminate MuseTalk child: {exc}") from exc
+        try:
+            child.wait(timeout=timeout)
+        except Exception as exc:
+            raise RuntimeError(f"MuseTalk child did not stop within {timeout:g} seconds") from exc
+        if child.poll() is None:
+            raise RuntimeError("MuseTalk child remains active after termination")
+
+
+class _PosixProcessGroupOwner:
+    def __init__(self, child: Any) -> None:
+        self._process_group = int(child.pid)
+
+    def stop(self, child: Any, timeout: float) -> None:
+        try:
+            os.killpg(self._process_group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError as exc:
+            raise RuntimeError(f"failed to terminate MuseTalk process group: {exc}") from exc
+        try:
+            child.wait(timeout=timeout)
+        except Exception as exc:
+            raise RuntimeError(
+                f"MuseTalk process group did not stop within {timeout:g} seconds"
+            ) from exc
+
+
+if os.name == "nt":
+    class _JobObjectBasicLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+
+    class _IoCounters(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong),
+        ]
+
+
+    class _JobObjectExtendedLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _JobObjectBasicLimitInformation),
+            ("IoInfo", _IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+
+    class _JobObjectBasicAccountingInformation(ctypes.Structure):
+        _fields_ = [
+            ("TotalUserTime", ctypes.c_longlong),
+            ("TotalKernelTime", ctypes.c_longlong),
+            ("ThisPeriodTotalUserTime", ctypes.c_longlong),
+            ("ThisPeriodTotalKernelTime", ctypes.c_longlong),
+            ("TotalPageFaultCount", wintypes.DWORD),
+            ("TotalProcesses", wintypes.DWORD),
+            ("ActiveProcesses", wintypes.DWORD),
+            ("TotalTerminatedProcesses", wintypes.DWORD),
+        ]
+
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    _kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    _kernel32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    _kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    _kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    _kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    _kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    _kernel32.TerminateJobObject.restype = wintypes.BOOL
+    _kernel32.QueryInformationJobObject.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+    ]
+    _kernel32.QueryInformationJobObject.restype = wintypes.BOOL
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+    _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _kernel32.OpenProcess.restype = wintypes.HANDLE
+    _kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    _kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+
+
+    def _windows_error(action: str) -> RuntimeError:
+        return RuntimeError(f"{action}: {ctypes.WinError(ctypes.get_last_error())}")
+
+
+    class _WindowsJobOwner:
+        """Own exactly one request's process tree through a Windows Job Object."""
+
+        _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+        _JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION = 1
+        _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+
+        def __init__(self, child: Any) -> None:
+            self._handle = _kernel32.CreateJobObjectW(None, None)
+            if not self._handle:
+                raise _windows_error("could not create MuseTalk Job Object")
+            try:
+                limits = _JobObjectExtendedLimitInformation()
+                limits.BasicLimitInformation.LimitFlags = (
+                    self._JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                )
+                if not _kernel32.SetInformationJobObject(
+                    self._handle,
+                    self._JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                    ctypes.byref(limits),
+                    ctypes.sizeof(limits),
+                ):
+                    raise _windows_error("could not configure MuseTalk Job Object")
+                if not _kernel32.AssignProcessToJobObject(
+                    self._handle, wintypes.HANDLE(int(child._handle))
+                ):
+                    raise _windows_error("could not assign MuseTalk child to Job Object")
+            except Exception:
+                _kernel32.CloseHandle(self._handle)
+                self._handle = None
+                _DirectChildOwner().stop(child, CHILD_STOP_TIMEOUT_SECONDS)
+                raise
+
+        def _active_processes(self) -> int:
+            accounting = _JobObjectBasicAccountingInformation()
+            if not _kernel32.QueryInformationJobObject(
+                self._handle,
+                self._JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION,
+                ctypes.byref(accounting),
+                ctypes.sizeof(accounting),
+                None,
+            ):
+                raise _windows_error("could not inspect MuseTalk Job Object")
+            return int(accounting.ActiveProcesses)
+
+        def stop(self, child: Any, timeout: float) -> None:
+            if self._handle is None:
+                raise RuntimeError("MuseTalk Job Object is already closed")
+            error: BaseException | None = None
+            try:
+                if self._active_processes() > 0 and not _kernel32.TerminateJobObject(
+                    self._handle, 1
+                ):
+                    raise _windows_error("could not terminate MuseTalk Job Object")
+                deadline = time.monotonic() + timeout
+                try:
+                    child.wait(timeout=max(0.01, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired as exc:
+                    raise RuntimeError(
+                        f"MuseTalk child did not stop within {timeout:g} seconds"
+                    ) from exc
+                while self._active_processes() > 0:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(
+                            f"MuseTalk owned process tree did not stop within {timeout:g} seconds"
+                        )
+                    time.sleep(0.01)
+            except BaseException as exc:
+                error = exc
+            finally:
+                handle = self._handle
+                self._handle = None
+                if handle and not _kernel32.CloseHandle(handle) and error is None:
+                    error = _windows_error("could not close MuseTalk Job Object")
+            if error is not None:
+                raise error
+
+
+def _create_child_owner(child: Any) -> Any:
+    if os.name == "nt" and hasattr(child, "_handle"):
+        return _WindowsJobOwner(child)
+    if os.name != "nt" and hasattr(child, "pid"):
+        return _PosixProcessGroupOwner(child)
+    return _DirectChildOwner()
+
+
+def _windows_pid_is_active(pid: int) -> bool:
+    """Return whether a Windows PID is active; used by cleanup verification."""
+    if os.name != "nt":
+        return False
+    process = _kernel32.OpenProcess(0x1000, False, int(pid))
+    if not process:
+        return False
+    try:
+        exit_code = wintypes.DWORD()
+        return bool(_kernel32.GetExitCodeProcess(process, ctypes.byref(exit_code))) and (
+            exit_code.value == 259
+        )
+    finally:
+        _kernel32.CloseHandle(process)
+
+
 def _write_bounded_log(log_path: Path, output: str | None) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     bounded = (output or "")[-MAX_LOG_CHARS:]
@@ -313,22 +544,6 @@ def _drain_child_output(stream: Any, tail: _TailBuffer) -> None:
         tail.append(f"\n[MuseTalk log reader failed: {exc}]\n")
 
 
-def _stop_child(child: Any) -> None:
-    try:
-        running = child.poll() is None
-    except Exception:
-        running = True
-    if running:
-        try:
-            child.kill()
-        except Exception:
-            pass
-    try:
-        child.wait(timeout=5)
-    except Exception:
-        pass
-
-
 def run_musetalk_command(
     command: list[str],
     *,
@@ -341,9 +556,9 @@ def run_musetalk_command(
     if not isinstance(command, list) or not command:
         raise ValueError("MuseTalk command must be a nonempty argument list")
     child = None
+    owner = None
     reader: threading.Thread | None = None
     tail = _TailBuffer()
-    finished = False
     try:
         try:
             child = _spawn_child(
@@ -355,9 +570,11 @@ def run_musetalk_command(
                 encoding="utf-8",
                 errors="replace",
                 shell=False,
+                **({"start_new_session": True} if os.name != "nt" else {}),
             )
         except OSError as exc:
             raise RuntimeError(f"MuseTalk child could not start: {exc}") from exc
+        owner = _create_child_owner(child)
         active_child = child
         if child.stdout is None:
             raise RuntimeError("MuseTalk child stdout pipe was not created")
@@ -370,16 +587,19 @@ def run_musetalk_command(
         reader.start()
         try:
             child.wait(timeout=timeout)
-            finished = True
         except subprocess.TimeoutExpired as exc:
-            _stop_child(child)
-            finished = True
             raise RuntimeError(f"MuseTalk child timed out after {timeout:g} seconds") from exc
         if child.returncode != 0:
             raise RuntimeError(f"MuseTalk child exited with status {child.returncode}")
     finally:
-        if child is not None and not finished:
-            _stop_child(child)
+        cleanup_error: BaseException | None = None
+        if child is not None:
+            try:
+                (owner or _DirectChildOwner()).stop(
+                    child, CHILD_STOP_TIMEOUT_SECONDS
+                )
+            except BaseException as exc:
+                cleanup_error = exc
         if reader is not None:
             reader.join(timeout=5)
             if reader.is_alive() and child is not None and child.stdout is not None:
@@ -391,6 +611,8 @@ def run_musetalk_command(
         if child is not None:
             _write_bounded_log(log_path, tail.value())
         active_child = None
+        if cleanup_error is not None:
+            raise cleanup_error
 
 
 def _resolve_tool(bin_dir: Path, name: str) -> str | None:
@@ -722,6 +944,29 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _stage_input(source: Path, destination: Path) -> str:
+    """Copy one caller file into the private job and attest the staged bytes."""
+    source = Path(source)
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with source.open("rb") as caller_file, destination.open("xb") as staged_file:
+            before = os.fstat(caller_file.fileno())
+            shutil.copyfileobj(caller_file, staged_file, length=1024 * 1024)
+            staged_file.flush()
+            os.fsync(staged_file.fileno())
+            after = os.fstat(caller_file.fileno())
+        identity_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+        if any(getattr(before, field) != getattr(after, field) for field in identity_fields):
+            raise RuntimeError(f"caller input changed while being staged: {source}")
+        if destination.stat().st_size <= 0:
+            raise RuntimeError(f"staged input is empty: {source}")
+        return _sha256(destination)
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+
+
 def _atomic_json(path: Path, payload: dict[str, Any]) -> Path:
     temp = path.with_name(f".{path.stem}.{uuid.uuid4().hex}.tmp.json")
     try:
@@ -749,26 +994,28 @@ def run_generation(
     output_dir = Path(request.output_dir)
     source_video = Path(request.video_path).resolve()
     source_audio = Path(request.audio_path).resolve()
-    source_video_sha256 = _sha256(source_video)
-    source_audio_sha256 = _sha256(source_audio)
     job_dir = create_job_directory(settings.job_root)
     published: Path | None = None
     manifest_path: Path | None = None
     started = time.perf_counter()
     try:
+        staged_video = job_dir / "source-video.mp4"
+        staged_audio = job_dir / "source-audio.wav"
+        source_video_sha256 = _stage_input(source_video, staged_video)
+        source_audio_sha256 = _stage_input(source_audio, staged_audio)
         ffmpeg = _resolve_tool(settings.ffmpeg_bin, "ffmpeg")
         ffprobe = _resolve_tool(settings.ffmpeg_bin, "ffprobe")
         if ffmpeg is None or ffprobe is None:
             raise RuntimeError("FFmpeg and ffprobe are required for MuseTalk generation")
         normalized_video = normalize_video(
-            source_video,
+            staged_video,
             job_dir / "video.mp4",
             float(request.target_duration),
             ffmpeg_executable=ffmpeg,
             ffprobe_executable=ffprobe,
         )
         normalized_audio = normalize_audio(
-            source_audio,
+            staged_audio,
             job_dir / "audio.wav",
             float(request.target_duration),
             ffmpeg_executable=ffmpeg,
