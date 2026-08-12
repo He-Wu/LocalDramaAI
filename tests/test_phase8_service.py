@@ -7,7 +7,9 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -102,12 +104,29 @@ def _audio(path: Path, *, seconds: float = 0.2) -> Path:
     )
 
 
+def _safe_job_root(tmp_path: Path) -> Path:
+    token = hashlib.sha256(str(tmp_path.resolve()).encode("utf-8")).hexdigest()[:16]
+    return (Path.cwd() / ".pytest-musetalk-jobs" / token).resolve()
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_safe_job_root(tmp_path):
+    job_root = _safe_job_root(tmp_path)
+    yield
+    shutil.rmtree(job_root, ignore_errors=True)
+    try:
+        job_root.parent.rmdir()
+    except OSError:
+        pass
+
+
 def _settings(tmp_path: Path) -> MuseTalkSettings:
     ffmpeg = Path(shutil.which("ffmpeg") or "ffmpeg")
     return MuseTalkSettings(
         repo_path=tmp_path / "MuseTalk",
         python_executable=Path(sys.executable),
         ffmpeg_bin=ffmpeg.parent,
+        job_root=_safe_job_root(tmp_path),
         timeout_seconds=5.0,
         repo_commit="test-commit",
     )
@@ -237,17 +256,17 @@ def test_generate_model_preserves_ordered_binding_metadata(tmp_path):
 
 
 def test_job_directories_and_published_names_are_unique(tmp_path):
-    output_dir = tmp_path / "output"
-    first = create_job_directory(output_dir)
-    second = create_job_directory(output_dir)
+    job_root = _safe_job_root(tmp_path)
+    first = create_job_directory(job_root)
+    second = create_job_directory(job_root)
 
     assert first != second
-    assert first.parent == second.parent == output_dir
+    assert first.parent == second.parent == job_root
     assert first.is_dir() and second.is_dir()
 
 
 def test_yaml_is_one_safe_task_and_expected_output_is_locked(tmp_path):
-    job_dir = create_job_directory(tmp_path / "output")
+    job_dir = create_job_directory(_safe_job_root(tmp_path))
     video = job_dir / "video.mp4"
     audio = job_dir / "audio.wav"
     task_path = write_inference_config(job_dir, video, audio)
@@ -437,13 +456,14 @@ def test_zero_exit_without_expected_output_is_failure_and_publishes_nothing(tmp_
         audio_path=str(_audio(tmp_path / "source.wav").resolve()),
     )
 
+    settings = _settings(tmp_path)
     with pytest.raises(RuntimeError, match="expected MuseTalk output"):
-        run_generation(request, _settings(tmp_path), command_runner=lambda *args, **kwargs: None)
+        run_generation(request, settings, command_runner=lambda *args, **kwargs: None)
 
     output = Path(request.output_dir)
     assert not list(output.glob("*.mp4"))
     assert not list(output.glob("*.manifest.json"))
-    assert not list(output.glob(".musetalk-job-*"))
+    assert not list(settings.job_root.glob(".musetalk-job-*"))
 
 
 def test_generation_cleans_job_when_tool_resolution_fails(tmp_path, monkeypatch):
@@ -454,10 +474,11 @@ def test_generation_cleans_job_when_tool_resolution_fails(tmp_path, monkeypatch)
 
     monkeypatch.setattr(service, "_resolve_tool", fail_resolution)
 
+    settings = _settings(tmp_path)
     with pytest.raises(OSError, match="cannot inspect FFmpeg"):
-        run_generation(request, _settings(tmp_path))
+        run_generation(request, settings)
 
-    assert not list(Path(request.output_dir).glob(".musetalk-job-*"))
+    assert not list(settings.job_root.glob(".musetalk-job-*"))
 
 
 def test_happy_stub_creates_canonical_av_and_atomic_manifest(tmp_path):
@@ -483,7 +504,8 @@ def test_happy_stub_creates_canonical_av_and_atomic_manifest(tmp_path):
         upstream.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(task["video_path"], upstream)
 
-    response = run_generation(request, _settings(tmp_path), command_runner=fake_runner)
+    settings = _settings(tmp_path)
+    response = run_generation(request, settings, command_runner=fake_runner)
     output = Path(response["output_path"])
     manifest_path = Path(response["manifest_path"])
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -497,7 +519,7 @@ def test_happy_stub_creates_canonical_av_and_atomic_manifest(tmp_path):
     assert (info.audio.codec, info.audio.channels) == ("aac", 1)
     assert info.duration >= request.target_duration - 0.04
     assert abs(info.video.duration - info.audio.duration) <= 0.08
-    assert seen["cwd"] == str(_settings(tmp_path).repo_path)
+    assert seen["cwd"] == str(settings.repo_path)
     assert manifest["provider"] == "musetalk"
     assert manifest["provider_version"] == "test-commit"
     assert manifest["model"] == "musetalk-v1.5"
@@ -532,7 +554,7 @@ def test_happy_stub_creates_canonical_av_and_atomic_manifest(tmp_path):
     assert Path(manifest["inference_config"]["task_0"]["video_path"]).name == "video.mp4"
     assert Path(manifest["inference_config"]["task_0"]["audio_path"]).name == "audio.wav"
     assert manifest["command"] == seen["command"]
-    assert not list(Path(request.output_dir).glob(".musetalk-job-*"))
+    assert not list(settings.job_root.glob(".musetalk-job-*"))
     assert not list(Path(request.output_dir).glob("*.tmp.mp4"))
     assert not list(Path(request.output_dir).glob("*.tmp.json"))
 
@@ -548,6 +570,7 @@ def test_generation_passes_resolved_path_ffmpeg_parent_to_official_cli(tmp_path)
         repo_path=settings.repo_path,
         python_executable=settings.python_executable,
         ffmpeg_bin=tmp_path / "configured-but-missing",
+        job_root=settings.job_root,
         timeout_seconds=settings.timeout_seconds,
         repo_commit=settings.repo_commit,
     )
@@ -567,6 +590,99 @@ def test_generation_passes_resolved_path_ffmpeg_parent_to_official_cli(tmp_path)
 
     command = seen["command"]
     assert Path(command[command.index("--ffmpeg_path") + 1]) == resolved_parent
+
+
+@pytest.mark.parametrize(
+    "job_root",
+    [
+        "relative/jobs",
+        "E:/LocalDramaAI/jobs with spaces",
+        "E:/LocalDramaAI/jobs&whoami",
+        "E:/LocalDramaAI/jobs%TEMP%",
+        "E:/LocalDramaAI/jobs;unsafe",
+    ],
+)
+def test_settings_rejects_non_shell_safe_job_root(monkeypatch, job_root):
+    monkeypatch.setenv("LOCALDRAMA_MUSETALK_JOB_ROOT", job_root)
+
+    with pytest.raises(ValueError, match="job root"):
+        MuseTalkSettings.from_env()
+
+
+def test_settings_accepts_absolute_shell_safe_job_root(monkeypatch):
+    job_root = Path("E:/LocalDramaAI/musetalk-jobs")
+    monkeypatch.setenv("LOCALDRAMA_MUSETALK_JOB_ROOT", str(job_root))
+
+    settings = MuseTalkSettings.from_env()
+
+    assert settings.job_root == job_root
+
+
+def test_generation_hides_unsafe_caller_paths_from_official_cli(tmp_path):
+    unsafe_parent = tmp_path / "caller path & data"
+    unsafe_parent.mkdir()
+    source_video = _video(unsafe_parent / "source video & portrait.mp4")
+    source_audio = _audio(unsafe_parent / "dialogue audio & voice.wav")
+    output_dir = (unsafe_parent / "published output & final").resolve()
+    request = _request(
+        tmp_path,
+        video_path=str(source_video.resolve()),
+        audio_path=str(source_audio.resolve()),
+        output_dir=str(output_dir),
+    )
+    job_root = (Path.cwd() / ".pytest-musetalk-jobs" / uuid.uuid4().hex).resolve()
+    base_settings = _settings(tmp_path)
+    settings_values = vars(base_settings).copy()
+    settings_values["job_root"] = job_root
+    settings = SimpleNamespace(**settings_values)
+    seen = {}
+
+    def fake_runner(command, *, cwd, timeout, log_path):
+        task_path = Path(command[command.index("--inference_config") + 1])
+        task = yaml.safe_load(task_path.read_text(encoding="utf-8"))["task_0"]
+        result_dir = Path(command[command.index("--result_dir") + 1])
+        upstream = expected_musetalk_output(result_dir)
+        upstream.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(task["video_path"], upstream)
+        seen.update(
+            command=command,
+            task=task,
+            task_path=task_path,
+            result_dir=result_dir,
+            upstream=upstream,
+            log_path=Path(log_path),
+        )
+
+    try:
+        response = run_generation(request, settings, command_runner=fake_runner)
+        manifest = json.loads(Path(response["manifest_path"]).read_text(encoding="utf-8"))
+
+        official_paths = [
+            seen["task_path"],
+            seen["result_dir"],
+            seen["upstream"],
+            seen["log_path"],
+            Path(seen["task"]["video_path"]),
+            Path(seen["task"]["audio_path"]),
+        ]
+        assert all(path.is_relative_to(job_root) for path in official_paths)
+        assert all(" " not in str(path) and "&" not in str(path) for path in official_paths)
+        for caller_path in (source_video.resolve(), source_audio.resolve(), output_dir):
+            assert all(str(caller_path) not in str(argument) for argument in seen["command"])
+            assert all(str(caller_path) != value for value in seen["task"].values())
+
+        assert Path(response["output_path"]).parent == output_dir
+        assert manifest["source_video"]["path"] == str(source_video.resolve())
+        assert manifest["source_audio"]["path"] == str(source_audio.resolve())
+        assert manifest["output_path"] == response["output_path"]
+        assert manifest["output_sha256"] == _sha256(Path(response["output_path"]))
+        assert not list(job_root.glob(".musetalk-job-*"))
+    finally:
+        shutil.rmtree(job_root, ignore_errors=True)
+        try:
+            job_root.parent.rmdir()
+        except OSError:
+            pass
 
 
 def test_invalid_upstream_never_leaves_partial_publication(tmp_path):
@@ -607,6 +723,7 @@ def _ready_layout(tmp_path: Path) -> MuseTalkSettings:
         repo_path=tmp_path / "MuseTalk",
         python_executable=tmp_path / "env" / "Scripts" / "python.exe",
         ffmpeg_bin=tmp_path / "ffmpeg" / "bin",
+        job_root=_safe_job_root(tmp_path),
         timeout_seconds=5,
         repo_commit="abc123",
     )
@@ -775,6 +892,57 @@ async def test_generate_endpoint_serializes_concurrent_requests(tmp_path, monkey
     assert first.status_code == second.status_code == 200
     assert state == {"active": 0, "maximum": 1, "calls": 2}
     assert first.json()["output_path"] != second.json()["output_path"]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_generate_keeps_lock_until_worker_finishes(tmp_path, monkeypatch):
+    request = _request(tmp_path)
+    first_started = threading.Event()
+    second_started = threading.Event()
+    release = threading.Event()
+    state_lock = threading.Lock()
+    state = {"active": 0, "maximum": 0, "calls": 0}
+
+    def blocking_generation(request):
+        with state_lock:
+            state["active"] += 1
+            state["calls"] += 1
+            state["maximum"] = max(state["maximum"], state["active"])
+            call = state["calls"]
+            (first_started if call == 1 else second_started).set()
+        assert release.wait(timeout=2)
+        with state_lock:
+            state["active"] -= 1
+        return {"output_path": f"output-{call}.mp4", "manifest_path": f"manifest-{call}.json"}
+
+    monkeypatch.setattr(service, "generation_lock", asyncio.Lock())
+    monkeypatch.setattr(service, "active_generation_tasks", set(), raising=False)
+    monkeypatch.setattr(service, "active_child", None)
+    monkeypatch.setattr(service, "run_generation", blocking_generation)
+    transport = httpx.ASGITransport(app=service.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first = asyncio.create_task(client.post("/generate", json=request.model_dump()))
+        assert await asyncio.to_thread(first_started.wait, 1)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        unload_while_cancelled = await client.post("/unload")
+        second = asyncio.create_task(client.post("/generate", json=request.model_dump()))
+        overlapped = await asyncio.to_thread(second_started.wait, 0.2)
+        try:
+            observed = (unload_while_cancelled.status_code, overlapped, state["maximum"])
+        finally:
+            release.set()
+            second_response = await second
+
+        await asyncio.sleep(0)
+        unload_after_completion = await client.post("/unload")
+
+    assert observed == (409, False, 1)
+    assert second_response.status_code == 200
+    assert state == {"active": 0, "maximum": 1, "calls": 2}
+    assert unload_after_completion.status_code == 200
 
 
 def test_unload_is_truthful_when_idle_or_active(monkeypatch):

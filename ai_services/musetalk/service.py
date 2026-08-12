@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -42,8 +43,12 @@ from app.services.media_probe import AVInfo, probe_av
 DEFAULT_REPO = Path("E:/LocalDramaAI/MuseTalk")
 DEFAULT_PYTHON = Path("E:/LocalDramaAI/env-musetalk/Scripts/python.exe")
 DEFAULT_FFMPEG_BIN = Path("E:/LocalDramaAI/ffmpeg/bin")
+DEFAULT_JOB_ROOT = Path("E:/LocalDramaAI/musetalk-jobs")
 DEFAULT_TIMEOUT_SECONDS = 1800.0
 MAX_LOG_CHARS = 1_000_000
+SHELL_SAFE_JOB_ROOT = re.compile(
+    r"^[A-Za-z]:[\\/](?:[A-Za-z0-9_.-]+(?:[\\/]|$))+$"
+)
 REQUIRED_MODEL_PATHS = (
     "models/musetalkV15/unet.pth",
     "models/musetalkV15/musetalk.json",
@@ -59,11 +64,27 @@ REQUIRED_MODEL_PATHS = (
 )
 
 
+def validate_job_root(job_root: Path) -> Path:
+    """Require a service-owned Windows path safe for upstream os.system calls."""
+    path = Path(job_root)
+    serialized = str(path)
+    if not path.is_absolute():
+        raise ValueError("MuseTalk job root must be absolute")
+    if any(part in {".", ".."} for part in path.parts[1:]):
+        raise ValueError("MuseTalk job root must not contain relative path segments")
+    if SHELL_SAFE_JOB_ROOT.fullmatch(serialized) is None:
+        raise ValueError(
+            "MuseTalk job root must contain only shell-safe ASCII path characters"
+        )
+    return path
+
+
 @dataclass(frozen=True)
 class MuseTalkSettings:
     repo_path: Path
     python_executable: Path
     ffmpeg_bin: Path
+    job_root: Path
     timeout_seconds: float
     repo_commit: str
 
@@ -76,6 +97,9 @@ class MuseTalkSettings:
             repo_path=Path(os.environ.get("LOCALDRAMA_MUSETALK_REPO", str(DEFAULT_REPO))),
             python_executable=Path(os.environ.get("LOCALDRAMA_MUSETALK_PYTHON", str(DEFAULT_PYTHON))),
             ffmpeg_bin=Path(os.environ.get("LOCALDRAMA_MUSETALK_FFMPEG_BIN", str(DEFAULT_FFMPEG_BIN))),
+            job_root=validate_job_root(
+                Path(os.environ.get("LOCALDRAMA_MUSETALK_JOB_ROOT", str(DEFAULT_JOB_ROOT)))
+            ),
             timeout_seconds=timeout,
             repo_commit=os.environ.get("LOCALDRAMA_MUSETALK_REPO_COMMIT", "unlocked").strip() or "unlocked",
         )
@@ -147,6 +171,7 @@ class AudioProbe:
 
 
 generation_lock = asyncio.Lock()
+active_generation_tasks: set[asyncio.Task[dict[str, Any]]] = set()
 active_child: Any | None = None
 app = FastAPI(title="LocalDramaAI MuseTalk", version="1.5")
 
@@ -188,10 +213,12 @@ def validate_generate_request(request: GenerateRequest) -> None:
         raise ValueError("use_float16 must be true")
 
 
-def create_job_directory(output_dir: Path) -> Path:
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    return Path(tempfile.mkdtemp(prefix=".musetalk-job-", dir=str(output_dir)))
+def create_job_directory(job_root: Path) -> Path:
+    job_root = validate_job_root(job_root)
+    job_root.mkdir(parents=True, exist_ok=True)
+    if not job_root.is_dir():
+        raise RuntimeError(f"MuseTalk job root is not a directory: {job_root}")
+    return Path(tempfile.mkdtemp(prefix=".musetalk-job-", dir=str(job_root)))
 
 
 def write_inference_config(job_dir: Path, video_path: Path, audio_path: Path) -> Path:
@@ -724,7 +751,7 @@ def run_generation(
     source_audio = Path(request.audio_path).resolve()
     source_video_sha256 = _sha256(source_video)
     source_audio_sha256 = _sha256(source_audio)
-    job_dir = create_job_directory(output_dir)
+    job_dir = create_job_directory(settings.job_root)
     published: Path | None = None
     manifest_path: Path | None = None
     started = time.perf_counter()
@@ -842,6 +869,21 @@ def _ready_file(path: Path) -> bool:
         return False
 
 
+def _service_busy() -> bool:
+    return bool(active_generation_tasks) or generation_lock.locked() or active_child is not None
+
+
+async def _run_generation_serialized(request: GenerateRequest) -> dict[str, Any]:
+    async with generation_lock:
+        return await asyncio.to_thread(run_generation, request)
+
+
+def _generation_task_done(task: asyncio.Task[dict[str, Any]]) -> None:
+    active_generation_tasks.discard(task)
+    if not task.cancelled():
+        task.exception()
+
+
 def check_cuda(settings: MuseTalkSettings, timeout: float = 20.0) -> dict[str, Any]:
     if not _ready_file(settings.python_executable):
         return {"available": False, "device": None, "detail": "Python executable is missing"}
@@ -894,7 +936,7 @@ def build_runtime_health(settings: MuseTalkSettings | None = None) -> dict[str, 
         "cuda": cuda.get("available") is True,
     }
     ready = all(checks.values())
-    busy = generation_lock.locked() or active_child is not None
+    busy = _service_busy()
     return {
         "status": "ONLINE" if ready else "DEGRADED",
         "ready": ready,
@@ -917,7 +959,7 @@ def health() -> dict[str, Any]:
         return {
             "status": "DEGRADED",
             "ready": False,
-            "busy": generation_lock.locked() or active_child is not None,
+            "busy": _service_busy(),
             "active_child": active_child is not None,
             "persistent_model": False,
             "detail": str(exc),
@@ -928,8 +970,10 @@ def health() -> dict[str, Any]:
 async def generate(request: GenerateRequest) -> dict[str, Any]:
     try:
         validate_generate_request(request)
-        async with generation_lock:
-            return await asyncio.to_thread(run_generation, request)
+        task = asyncio.create_task(_run_generation_serialized(request))
+        active_generation_tasks.add(task)
+        task.add_done_callback(_generation_task_done)
+        return await asyncio.shield(task)
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
@@ -938,7 +982,7 @@ async def generate(request: GenerateRequest) -> dict[str, Any]:
 
 @app.post("/unload")
 def unload() -> dict[str, Any]:
-    if generation_lock.locked() or active_child is not None:
+    if _service_busy():
         raise HTTPException(status_code=409, detail="MuseTalk generation child is active")
     return {
         "status": "UNLOADED",
