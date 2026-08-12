@@ -52,8 +52,8 @@ The complete smoke peaked close to the 32 GB physical-RAM limit and used a 52.2 
 
 | Pipeline | Output profile | Service generation | End-to-end elapsed | Peak VRAM | Peak RAM | Peak Windows commit | Peak GPU / temperature | Result |
 |---|---|---:|---:|---:|---:|---:|---:|---|
-| Official MuseTalk 1.5, FP16, batch 4 | 640x368, 70 frames, 25 FPS, H.264/yuv420p + AAC mono 16 kHz | 32.8725 s | 35.976 s | 9,219 MiB | 23,341 MiB | 34,141 MiB | 99% / 67 C | Success |
+| Official MuseTalk 1.5, FP16, batch 4 | 640x368, 70 frames, 25 FPS, H.264/yuv420p + AAC mono 16 kHz | 35.8198 s | 39.139 s | 9,199 MiB | 23,548 MiB | 34,272 MiB | 97% / 75 C | Success |
 
-Output: `E:\kang\github\Movie\artifacts\phase8\20260812-203657-29f959d5\output\musetalk-b9a88f6a1b1a4428965b79a737da58b3.mp4` (video 2.80 s, audio 2.78 s, A/V end delta 20 ms, SHA256 `73867115bff94ee05eadd31b5a2954eca4c0e1173ff30e95e9b55424d202ef27`). Full FFmpeg decode and database/provider-manifest link validation passed; ports 8020, 8030, and 8188 were free after verification.
+Output: `E:\kang\github\Movie\artifacts\phase8\20260812-205621-fad213b5\output\musetalk-e0eac769dadc4242ae8b6ac2f9ea55ab.mp4` (video 2.80 s, audio 2.78 s, A/V end delta 20 ms, SHA256 `58029ed0c9f539daed13faf643fba3c03f0c93e23d2814bfd36a44c144d09f98`). Full FFmpeg decode and database/provider-manifest link validation passed; ports 8020, 8030, and 8188 were free after verification.
 
 Start/middle/end frames and the mouth contact sheet were visually approved: mouth shapes vary plausibly without a visible jaw/hand seam, mask edge, mouth tearing, severe flicker, or identity change. The Wan source is slightly soft, so the output is an accepted lip-sync baseline rather than a final-quality render. Phase 8 does not generate subtitles or a final timeline.
