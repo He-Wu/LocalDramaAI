@@ -109,7 +109,7 @@ def _assert_phase8_shot_schema(database):
             "lipsync_asset_id": None,
             "video_asset_id": "video-asset-1",
         }
-        assert revision == "0001_phase8_shot_lipsync"
+        assert revision == "0002_phase9_project_outputs"
     finally:
         engine.dispose()
 
