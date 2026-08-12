@@ -39,6 +39,9 @@ For every Shot:
   result is an error rather than a silent VIDEO fallback.
 - Otherwise require its project-owned `VIDEO` Asset and use `video_asset_id`.
 - Preserve every upstream Shot link and status.
+- Snapshot `character_id`, `storyboard_asset_id`, `video_asset_id`, and
+  `lipsync_asset_id`; any concurrent change is stale even when the field is not
+  the selected render source.
 - Require a readable, nonempty real media file and snapshot its resolved path,
   byte size, SHA256, Asset ID, and relevant database fields.
 
@@ -80,17 +83,27 @@ The fixed render profile is:
 
 - MP4 container with H.264/libx264, yuv420p, 640x368, 25 FPS, SAR 1.
 - AAC-LC, 48 kHz stereo, timeline duration equal to the video within 80 ms.
-- Fixed x264 preset/CRF/GOP/scenecut settings and `+faststart`.
+- libx264 preset `medium`, CRF 18, GOP 50, `keyint_min=25`,
+  `sc_threshold=0`, one encoding thread, CFR 25, and `+faststart`.
+- AAC-LC at 48 kHz stereo and 192 kbit/s.
 - Microsoft YaHei from the local Windows font directory, with exact path, byte
   size, and SHA256 recorded in the Phase 9 evidence. The renderer fails if the
   required libass/subtitles filter or locked font is unavailable.
 
 Each Shot normalization command receives paths only as argv entries, with
 `shell=False`, `-nostdin`, `stdin=DEVNULL`, bounded timeout, hidden-window flags,
-and a private UUID directory. Video is scaled with preserved aspect ratio, padded,
+and a private UUID directory. Bare command names are resolved with `shutil.which`
+before their real executable paths are attested. Video is scaled with preserved aspect ratio, padded,
 setsar/fps normalized, trimmed to the exact frame count, and padded only for the
 quantization tail. Audio is rebuilt from WAV inputs using resampling, explicit
 delays, and finite silence, then trimmed/padded to the exact total frame duration.
+Before filter construction, copy the attested font bytes and SRT into the private
+job directory as controlled ASCII names `fonts/locked-font.ttc` and
+`subtitles.srt`. Run FFmpeg with that directory as `cwd` and use only those ASCII
+relative names in `subtitles=...:fontsdir=fonts`; no caller path appears inside a
+filter expression. Subtitle burn-in uses Microsoft YaHei at 22 px, white with a black 2 px outline,
+no shadow, bottom-centre alignment, and a 24 px bottom margin. A zero-cue project
+skips the subtitles filter while retaining the same silent AAC output profile.
 
 FFmpeg commands write unique temporary files. A nonzero exit, timeout, missing or
 empty output, failed probe, full-decode error, or cleanup failure is an error.
@@ -113,12 +126,15 @@ Never overwrite historical Asset bytes. Store immutable versioned artifacts at:
 - `storage/projects/{project_id}/subtitles/{generation_id}.srt`
 - `storage/projects/{project_id}/render/{generation_id}.mp4`
 
-The final video Asset points to the immutable render file. The required canonical
-alias is atomically published through a same-directory temporary file to:
+The final video Asset points to the immutable render file. Its provider manifest
+is atomically stored at `storage/projects/{project_id}/manifests/{generation_id}.json`.
+The required canonical alias is atomically published through a same-directory temporary file to:
 
 `storage/projects/{project_id}/output/final.mp4`
 
-The canonical alias and immutable Asset must have identical SHA256 hashes. Asset
+The canonical alias is a reconstructible cache; the Project pointer and immutable
+Asset are authoritative. On every successful return the alias and immutable Asset
+must have identical SHA256 hashes. Asset
 metadata records the render profile, ordered role-tagged timeline, exact source
 paths/hashes, cue count, durations, FFmpeg/font identity, immutable path,
 published path, and output hash.
@@ -132,21 +148,39 @@ timeline/render plan is stored as `workflow_hash`.
 ## Concurrency, stale state, and failure behavior
 
 Rendering never holds a long database write transaction. It snapshots and hashes
-inputs, writes the immutable SRT and candidate render, probes and fully decodes the
-candidate, then acquires a per-project filesystem publication lock. Inside the
-lock it opens a short SQLite `BEGIN IMMEDIATE` transaction (row locks on other
-databases), rereads the complete snapshot, and rejects any changed order, text,
-duration, asset link, asset path, or current output pointer.
+inputs, writes the immutable SRT, durable provider manifest, and candidate render,
+probes and fully decodes the candidate, then acquires a per-project filesystem
+publication lock. It first reconciles a missing/stale canonical alias from the
+current authoritative Project pointer. Inside the lock it opens a short SQLite
+`BEGIN IMMEDIATE` transaction (row locks on other databases), rereads the complete
+explicit snapshot, and rejects changed Project pointers, order, text, persisted
+timing, flags/status, upstream links, Asset owner/kind/path/size, or input hashes.
 
-After the stale-state check, it publishes the canonical alias and atomically adds
-the two Assets, two Manifests, and Project pointers. A caught database failure
-restores the previous canonical alias. A crash may leave an unregistered immutable
-file, but the database must never claim a missing or mismatched success. A later
-verifier or rerun can identify and clean orphaned files.
+After the stale-state check, the transaction adds the two Assets, two Manifests,
+and Project pointers and commits. It then atomically rebuilds the canonical alias
+from the new immutable Asset and verifies the hash before returning. Successful
+publication returns `alias_status=READY`. If publication fails after commit, the
+operation returns a committed result with `alias_status=DEGRADED` and the cleanup
+error; it does not raise an ordinary precommit failure or claim the pointer stayed
+unchanged. Phase 9 acceptance and Job completion require READY. A crash may
+leave orphan immutable files or a missing/stale alias cache, but never a Project
+pointer to missing immutable bytes. The next render reconciles the alias from the
+authoritative Project pointer. `verify_phase9` is strictly read-only and rejects
+a missing/stale alias. Alias publication failure is reported and is not described
+as an accepted Phase 9 operation.
 
 Two concurrent renders for the same Project are serialized at publication. A
-stale loser cannot overwrite the winner. Failures leave upstream Assets, Shot
-links/statuses, and any previously accepted final output unchanged.
+stale loser cannot overwrite the winner. Precommit failures leave upstream Assets,
+Shot links/statuses, Project pointers, and any previously accepted final output
+unchanged. Postcommit alias degradation preserves the new authoritative result
+and is explicitly distinguishable and repairable.
+
+Manifest inputs are exact. The SUBTITLE manifest contains chronological AUDIO
+Asset IDs, one per cue (duplicates preserved), or `[]` for zero cues. The
+FINAL_VIDEO manifest flattens each chronological Shot as its selected VIDEO or
+LIPSYNC Asset ID followed by that Shot's chronological Dialogue AUDIO Asset IDs;
+after all Shots it appends the new SUBTITLE Asset ID only when at least one cue was
+burned. Zero-cue renders do not list the unconsumed subtitle Asset.
 
 ## Real smoke and acceptance
 
@@ -176,7 +210,8 @@ Acceptance requires:
   ordered inputs, hashes, and database snapshot all agree.
 - `scripts.verify_phase9` independently rechecks paths, hashes, SRT timing,
   database links, probes, frame count, full decode, and absence of owned FFmpeg
-  processes or temporary files.
+  processes or temporary files. Evidence must record `alias_status=READY`; a
+  DEGRADED result or alias mismatch fails read-only verification.
 - Runtime lock and documentation record FFmpeg build, font identity, timing,
   resource use, output/database/evidence hashes, visual review, and the explicit
   Phase 10 limitation.
