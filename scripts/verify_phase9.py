@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -37,6 +38,37 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def git_identity() -> dict[str, str]:
+    common = subprocess.run(
+        ["git", "-C", str(ROOT), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        capture_output=True, text=True, timeout=30, shell=False,
+    )
+    head = subprocess.run(
+        ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+        capture_output=True, text=True, timeout=30, shell=False,
+    )
+    if common.returncode != 0 or head.returncode != 0:
+        raise RuntimeError("cannot attest LocalDramaAI Git identity")
+    common_dir = Path(common.stdout.strip()).resolve(strict=True)
+    return {"repository": str(common_dir.parent), "commit": head.stdout.strip()}
+
+
+def _verify_git_identity(record: object) -> None:
+    expected = _require_record(record, "git")
+    current = git_identity()
+    if Path(expected.get("repository", "")).resolve() != Path(current["repository"]):
+        raise RuntimeError("Phase 9 Git repository identity mismatch")
+    commit = expected.get("commit")
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise RuntimeError("Phase 9 Git commit identity mismatch")
+    ancestor = subprocess.run(
+        ["git", "-C", str(ROOT), "merge-base", "--is-ancestor", commit, "HEAD"],
+        capture_output=True, timeout=30, shell=False,
+    )
+    if ancestor.returncode != 0:
+        raise RuntimeError("Phase 9 Git commit is not an ancestor of the current checkout")
 
 
 def _require_record(record: object, label: str) -> dict:
@@ -402,15 +434,7 @@ def verify_phase9(
     resource_payload = json.loads(resources.read_text(encoding="utf-8"))
     if resource_payload.get("peaks") != evidence["resources"].get("peaks"):
         raise RuntimeError("Phase 9 resource evidence mismatch")
-    git = _require_record(evidence.get("git"), "git")
-    if Path(git.get("repository", "")).resolve() != ROOT:
-        raise RuntimeError("Phase 9 Git repository identity mismatch")
-    result = subprocess.run(
-        ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
-        capture_output=True, text=True, timeout=30, shell=False,
-    )
-    if result.returncode != 0 or result.stdout.strip() != git.get("commit"):
-        raise RuntimeError("Phase 9 Git identity mismatch")
+    _verify_git_identity(evidence.get("git"))
     _reject_temps_and_owned_processes(evidence_path.parent)
     return {
         "status": "VERIFIED",

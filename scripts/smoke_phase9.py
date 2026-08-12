@@ -25,7 +25,7 @@ from app.services.audio_probe import probe_wav
 from app.services.render_generation import render_project
 from app.services.video_probe import probe_video
 from app.services.media_probe import probe_av
-from scripts.verify_phase9 import verify_phase9
+from scripts.verify_phase9 import git_identity, verify_phase9
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -279,16 +279,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _git_identity() -> dict:
-    result = subprocess.run(
-        ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        shell=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError("cannot attest LocalDramaAI Git commit")
-    return {"repository": str(ROOT), "commit": result.stdout.strip()}
+    return git_identity()
 
 
 def _resource_snapshot() -> dict:

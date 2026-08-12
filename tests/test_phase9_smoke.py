@@ -19,7 +19,7 @@ from scripts.smoke_phase9 import (
     run_smoke,
     validate_run_id,
 )
-from scripts.verify_phase9 import resolve_approved_path, verify_phase9
+from scripts.verify_phase9 import git_identity, resolve_approved_path, verify_phase9
 
 
 @pytest.fixture(scope="module")
@@ -117,6 +117,13 @@ def test_real_smoke_and_read_only_verifier_pass_full_decode(real_evidence) -> No
         "visual_review": "approved",
     }
     assert (database.read_bytes(), evidence_path.read_bytes()) == before
+
+
+def test_git_identity_uses_shared_repository_root_not_worktree() -> None:
+    identity = git_identity()
+
+    assert Path(identity["repository"]).resolve() == Path("E:/kang/github/Movie").resolve()
+    assert len(identity["commit"]) == 40
 
 
 def _mutated_evidence(real_evidence, tmp_path: Path, mutate) -> tuple[Path, Path]:
