@@ -178,6 +178,91 @@ def _run_failed_batch_guard(database: Path, foreign_keys_enabled: bool):
         engine.dispose()
 
 
+def _run_phase9_upgrade_with_rename_failure(database: Path):
+    engine = create_engine(f"sqlite:///{database.as_posix()}")
+
+    @event.listens_for(engine, "connect")
+    def enable_foreign_keys(dbapi_connection, _):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    rename_failure_injected = False
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def fail_first_projects_rename(
+        _connection,
+        _cursor,
+        statement,
+        _parameters,
+        _context,
+        _executemany,
+    ):
+        nonlocal rename_failure_injected
+        normalized_statement = " ".join(statement.upper().split())
+        if (
+            not rename_failure_injected
+            and normalized_statement
+            == "ALTER TABLE _ALEMBIC_TMP_PROJECTS RENAME TO PROJECTS"
+        ):
+            rename_failure_injected = True
+            raise RuntimeError("injected projects rename failure")
+
+    migration = importlib.import_module(
+        "migrations.versions.0002_phase9_project_outputs"
+    )
+    try:
+        with engine.connect() as connection:
+            context = MigrationContext.configure(
+                connection,
+                opts={"render_as_batch": True},
+            )
+            with Operations.context(context):
+                with pytest.raises(
+                    RuntimeError,
+                    match="injected projects rename failure",
+                ):
+                    migration.upgrade()
+
+                tables_after_failure = inspect(connection).get_table_names()
+                pragma_after_failure = connection.execute(
+                    text("PRAGMA foreign_keys")
+                ).scalar_one()
+                foreign_key_violations_after_failure = connection.execute(
+                    text("PRAGMA foreign_key_check")
+                ).all()
+                rows_after_failure = {
+                    "projects": connection.execute(
+                        text("SELECT id FROM projects")
+                    ).all(),
+                    "assets": connection.execute(
+                        text("SELECT id FROM assets ORDER BY id")
+                    ).all(),
+                    "scenes": connection.execute(
+                        text("SELECT id FROM scenes")
+                    ).all(),
+                }
+
+                migration.upgrade()
+
+            columns_after_retry = {
+                column["name"]
+                for column in inspect(connection).get_columns("projects")
+            }
+        return {
+            "failure_injected": rename_failure_injected,
+            "tables_after_failure": tables_after_failure,
+            "pragma_after_failure": pragma_after_failure,
+            "foreign_key_violations_after_failure": (
+                foreign_key_violations_after_failure
+            ),
+            "rows_after_failure": rows_after_failure,
+            "columns_after_retry": columns_after_retry,
+        }
+    finally:
+        engine.dispose()
+
+
 def _assert_phase9_project_schema(database: Path) -> None:
     engine = create_engine(f"sqlite:///{database.as_posix()}")
     try:
@@ -289,6 +374,27 @@ def test_failed_batch_guard_rolls_back_and_restores_foreign_key_setting(
 
     assert pragma == int(foreign_keys_enabled)
     assert persisted_rows == []
+
+
+def test_failed_batch_recreate_cleans_temp_table_and_allows_immediate_retry(tmp_path):
+    database = tmp_path / "failed-recreate.db"
+    _create_phase8_database(database)
+
+    outcome = _run_phase9_upgrade_with_rename_failure(database)
+
+    assert outcome["failure_injected"] is True
+    assert "_alembic_tmp_projects" not in outcome["tables_after_failure"]
+    assert outcome["pragma_after_failure"] == 1
+    assert outcome["foreign_key_violations_after_failure"] == []
+    assert outcome["rows_after_failure"] == {
+        "projects": [("project-1",)],
+        "assets": [("subtitle-asset-1",), ("video-asset-1",)],
+        "scenes": [("scene-1",)],
+    }
+    assert {
+        "subtitle_asset_id",
+        "final_video_asset_id",
+    } <= outcome["columns_after_retry"]
 
 
 def test_initialize_database_is_idempotent_after_create_all(tmp_path):

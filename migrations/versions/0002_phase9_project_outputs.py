@@ -56,6 +56,23 @@ def _disable_sqlite_foreign_keys_for_batch_recreate() -> Iterator[None]:
                 f"SQLite migration rollback also failed: {cleanup_error!r}"
             )
         try:
+            bind.exec_driver_sql(
+                "DROP TABLE IF EXISTS _alembic_tmp_projects"
+            )
+            bind.commit()
+        except BaseException as cleanup_error:
+            migration_error.add_note(
+                "Removing Alembic's temporary projects table also failed: "
+                f"{cleanup_error!r}"
+            )
+            try:
+                bind.rollback()
+            except BaseException as rollback_error:
+                migration_error.add_note(
+                    "SQLite migration cleanup rollback also failed: "
+                    f"{rollback_error!r}"
+                )
+        try:
             bind.exec_driver_sql("PRAGMA foreign_keys=ON")
             bind.commit()
         except BaseException as cleanup_error:
