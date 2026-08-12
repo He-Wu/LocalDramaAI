@@ -70,13 +70,14 @@ class PipelineOrchestrator:
         state.initialize()
         job, stages = self._snapshot(job_id)
         context = self._context(self.database_url, job)
+        stage_input = {**context.input_json, "project_id": context.project_id}
 
         if job.status == JobStatus.COMPLETED:
             return job
 
         if job.type != JobType.FULL_DRAMA:
             first_stage = PIPELINE_STAGES[0]
-            if not self._start_or_cancel(state, first_stage, context.input_json):
+            if not self._start_or_cancel(state, first_stage, stage_input):
                 return self._result(job_id)
             state.fail(
                 first_stage,
@@ -92,7 +93,7 @@ class PipelineOrchestrator:
                 last_stage_output = stage_row.output_json or {}
                 continue
 
-            if not self._start_or_cancel(state, stage, context.input_json):
+            if not self._start_or_cancel(state, stage, stage_input):
                 return self._result(job_id)
 
             try:

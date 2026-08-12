@@ -80,7 +80,7 @@ def persisted(database_url, job_id):
 async def test_success_runs_all_stages_in_order_and_returns_completed_job(tmp_path):
     database_url, job_id, project_id = seed(
         tmp_path,
-        input_json={"title": "The Last Frame"},
+        input_json={"title": "The Last Frame", "project_id": "malicious-override"},
     )
     runtime = RecordingRuntime()
 
@@ -93,12 +93,20 @@ async def test_success_runs_all_stages_in_order_and_returns_completed_job(tmp_pa
             database_url=database_url,
             job_id=job_id,
             project_id=project_id,
-            input_json={"title": "The Last Frame"},
+            input_json={
+                "title": "The Last Frame",
+                "project_id": "malicious-override",
+            },
         )
         for _, context in runtime.calls
     )
     job, stages = persisted(database_url, job_id)
     assert all(stages[stage].status == StageStatus.COMPLETED for stage in PIPELINE_STAGES)
+    assert all(
+        stages[stage].input_json
+        == {"title": "The Last Frame", "project_id": project_id}
+        for stage in PIPELINE_STAGES
+    )
     assert job.status == JobStatus.COMPLETED
     assert job.current_stage == "complete"
     assert job.output_json == {
