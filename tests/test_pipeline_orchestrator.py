@@ -1,11 +1,17 @@
 import json
+from copy import deepcopy
 
 import pytest
 
 from app.core.enums import PIPELINE_STAGES, JobStatus, JobType, StageStatus
 from app.db.session import create_schema, session_scope
 from app.models import GenerationJob, JobStage, Project
-from app.pipeline import PipelineContext, PipelineOrchestrator, PipelineState
+from app.pipeline import (
+    PipelineCancellationRequested,
+    PipelineContext,
+    PipelineOrchestrator,
+    PipelineState,
+)
 
 
 class RecordingRuntime:
@@ -46,6 +52,42 @@ class InvalidOutputRuntime(RecordingRuntime):
     async def execute(self, stage, context):
         self.calls.append((stage, context))
         return self.invalid_output
+
+
+class CancellingRuntime(RecordingRuntime):
+    def __init__(self, database_url, job_id, *, output=None, error=None):
+        super().__init__(database_url, job_id)
+        self.output = output
+        self.error = error
+
+    async def execute(self, stage, context):
+        self.calls.append((stage, context))
+        PipelineState(self.database_url, self.job_id).request_cancel()
+        if self.error is not None:
+            raise self.error
+        return self.output
+
+
+class ReservedOutputRuntime(RecordingRuntime):
+    async def execute(self, stage, context):
+        self.calls.append((stage, context))
+        return {
+            "artifact": f"{stage.value}.json",
+            "project_id": "malicious-override",
+        }
+
+
+class NestedMutatingRuntime(RecordingRuntime):
+    def __init__(self):
+        super().__init__()
+        self.seen_inputs = []
+
+    async def execute(self, stage, context):
+        self.calls.append((stage, context))
+        self.seen_inputs.append(deepcopy(context.input_json))
+        context.input_json["nested"]["items"].append(stage.value)
+        context.input_json["nested"]["settings"]["mode"] = stage.value
+        return {"artifact": f"{stage.value}.json"}
 
 
 def seed(tmp_path, *, job_type=JobType.FULL_DRAMA, input_json=None):
@@ -117,6 +159,44 @@ async def test_success_runs_all_stages_in_order_and_returns_completed_job(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_final_output_cannot_override_trusted_project_id(tmp_path):
+    database_url, job_id, project_id = seed(tmp_path)
+    runtime = ReservedOutputRuntime()
+
+    result = await PipelineOrchestrator(database_url, runtime).run(job_id)
+
+    assert result.status == JobStatus.COMPLETED
+    assert result.output_json == {
+        "artifact": "manifest_export.json",
+        "project_id": project_id,
+    }
+
+
+@pytest.mark.asyncio
+async def test_nested_runtime_mutation_cannot_change_contexts_or_stage_snapshots(tmp_path):
+    original_input = {
+        "nested": {
+            "items": ["original"],
+            "settings": {"mode": "original"},
+        }
+    }
+    database_url, job_id, project_id = seed(tmp_path, input_json=original_input)
+    runtime = NestedMutatingRuntime()
+
+    result = await PipelineOrchestrator(database_url, runtime).run(job_id)
+
+    job, stages = persisted(database_url, job_id)
+    assert result.status == JobStatus.COMPLETED
+    assert runtime.seen_inputs == [original_input] * len(PIPELINE_STAGES)
+    assert len({id(context) for _, context in runtime.calls}) == len(PIPELINE_STAGES)
+    assert all(
+        stages[stage].input_json == {**original_input, "project_id": project_id}
+        for stage in PIPELINE_STAGES
+    )
+    assert job.input_json == original_input
+
+
+@pytest.mark.asyncio
 async def test_runtime_failure_is_persisted_and_stops_later_stages(tmp_path):
     database_url, job_id, _ = seed(tmp_path)
     failed_stage = PIPELINE_STAGES[3]
@@ -182,6 +262,51 @@ async def test_all_completed_resume_uses_persisted_manifest_output(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("persisted_output", "message"),
+    [
+        (["corrupt"], "persisted stage output must be a dict"),
+        (
+            {"duration": float("nan")},
+            "persisted stage output must be JSON serializable",
+        ),
+    ],
+)
+async def test_invalid_completed_manifest_output_becomes_diagnosable_failure(
+    tmp_path,
+    persisted_output,
+    message,
+):
+    database_url, job_id, _ = seed(tmp_path)
+    state = PipelineState(database_url, job_id)
+    state.initialize()
+    for stage in PIPELINE_STAGES:
+        state.start(stage, {})
+        state.complete(stage, {"stage": stage.value})
+    with session_scope(database_url) as session:
+        manifest_stage = session.query(JobStage).filter_by(
+            job_id=job_id,
+            stage=PIPELINE_STAGES[-1],
+        ).one()
+        manifest_stage.output_json = persisted_output
+
+    result = await PipelineOrchestrator(
+        database_url,
+        RecordingRuntime(),
+    ).run(job_id)
+
+    job, stages = persisted(database_url, job_id)
+    manifest_stage = stages[PIPELINE_STAGES[-1]]
+    assert result.status == job.status == JobStatus.FAILED
+    assert job.current_stage == PIPELINE_STAGES[-1].value
+    assert job.error_code == "INVALID_STAGE_OUTPUT"
+    assert job.error_message == message
+    assert manifest_stage.status == StageStatus.FAILED
+    assert manifest_stage.error_code == "INVALID_STAGE_OUTPUT"
+    assert manifest_stage.error_message == message
+
+
+@pytest.mark.asyncio
 async def test_cancellation_before_first_stage_never_calls_runtime(tmp_path):
     database_url, job_id, _ = seed(tmp_path)
     state = PipelineState(database_url, job_id)
@@ -216,6 +341,42 @@ async def test_cancellation_between_stages_stops_before_next_runtime_call(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_cancellation_during_execute_wins_over_runtime_exception(tmp_path):
+    database_url, job_id, _ = seed(tmp_path)
+    runtime = CancellingRuntime(
+        database_url,
+        job_id,
+        error=ProviderError("provider stopped during cancellation"),
+    )
+
+    result = await PipelineOrchestrator(database_url, runtime).run(job_id)
+
+    job, stages = persisted(database_url, job_id)
+    first_stage = PIPELINE_STAGES[0]
+    assert result.status == job.status == JobStatus.CANCELLED
+    assert job.error_code is None
+    assert stages[first_stage].status == StageStatus.CANCELLED
+    assert stages[first_stage].error_code is None
+    assert len(runtime.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_execute_wins_over_invalid_output(tmp_path):
+    database_url, job_id, _ = seed(tmp_path)
+    runtime = CancellingRuntime(database_url, job_id, output=["invalid"])
+
+    result = await PipelineOrchestrator(database_url, runtime).run(job_id)
+
+    job, stages = persisted(database_url, job_id)
+    first_stage = PIPELINE_STAGES[0]
+    assert result.status == job.status == JobStatus.CANCELLED
+    assert job.error_code is None
+    assert stages[first_stage].status == StageStatus.CANCELLED
+    assert stages[first_stage].error_code is None
+    assert len(runtime.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_cancellation_race_during_start_is_cancelled_not_failed(tmp_path, monkeypatch):
     database_url, job_id, _ = seed(tmp_path)
     runtime = RecordingRuntime()
@@ -227,7 +388,10 @@ async def test_cancellation_race_during_start_is_cancelled_not_failed(tmp_path, 
         if not raced:
             raced = True
             state.request_cancel()
-        real_start(state, stage, input_json)
+        try:
+            real_start(state, stage, input_json)
+        except PipelineCancellationRequested:
+            raise PipelineCancellationRequested("cancelled with revised wording") from None
 
     monkeypatch.setattr(PipelineState, "start", cancel_then_start)
 

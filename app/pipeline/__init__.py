@@ -1,8 +1,9 @@
 from .contracts import PipelineContext, PipelineRuntime
+from .state import PipelineCancellationRequested, PipelineState
 from .orchestrator import PipelineOrchestrator
-from .state import PipelineState
 
 __all__ = [
+    "PipelineCancellationRequested",
     "PipelineContext",
     "PipelineOrchestrator",
     "PipelineRuntime",

@@ -10,6 +10,10 @@ from app.db.session import session_scope
 from app.models import GenerationJob, JobEvent, JobStage
 
 
+class PipelineCancellationRequested(ValueError):
+    """A stage start was blocked by a durable cancellation request."""
+
+
 class PipelineState:
     def __init__(self, database_url: str, job_id: str):
         self.database_url = database_url
@@ -147,7 +151,9 @@ class PipelineState:
                 ),
             )
             if job.cancel_requested_at is not None:
-                raise ValueError("cannot start stage while cancellation is requested")
+                raise PipelineCancellationRequested(
+                    "cannot start stage while cancellation is requested"
+                )
             rows = self._stages(session)
             row = next((item for item in rows if item.stage == stage), None)
             if row is None:
@@ -210,6 +216,43 @@ class PipelineState:
             row.error_message = message
             row.completed_at = datetime.now(timezone.utc)
             job.status = JobStatus.FAILED
+            job.error_code = code
+            job.error_message = message
+            self._event(
+                session,
+                "stage_failed",
+                job.progress,
+                message,
+                {"stage": stage.value, "code": code},
+            )
+
+    def fail_completed_output(
+        self,
+        stage: PipelineStage,
+        code: str,
+        message: str,
+    ) -> None:
+        """Fail a completed stage whose durable output violates its contract."""
+        self._stage_index(stage)
+        with self._write_session() as session:
+            job = self._job(session)
+            self._require_job_status(
+                job,
+                "fail completed output for",
+                (JobStatus.RUNNING,),
+            )
+            row = self._stage(session, stage)
+            self._require_status(
+                row,
+                "fail completed output for",
+                (StageStatus.COMPLETED,),
+            )
+            row.status = StageStatus.FAILED
+            row.error_code = code
+            row.error_message = message
+            row.completed_at = datetime.now(timezone.utc)
+            job.status = JobStatus.FAILED
+            job.current_stage = stage.value
             job.error_code = code
             job.error_message = message
             self._event(

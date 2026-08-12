@@ -8,11 +8,14 @@ from app.db.session import session_scope
 from app.models import GenerationJob, JobStage
 
 from .contracts import PipelineContext, PipelineRuntime
-from .state import PipelineState
+from .state import PipelineCancellationRequested, PipelineState
 
 
 class PipelineOrchestrator:
-    """Run a durable pipeline and return the refreshed ``GenerationJob``."""
+    """Run a durable pipeline and return a detached ``GenerationJob`` snapshot.
+
+    Scalar columns are available after return; ORM relationships are not loaded.
+    """
 
     def __init__(self, database_url: str, runtime: PipelineRuntime):
         self.database_url = database_url
@@ -48,6 +51,32 @@ class PipelineOrchestrator:
         )
 
     @staticmethod
+    def _runtime_context(context: PipelineContext) -> PipelineContext:
+        return PipelineContext(
+            database_url=context.database_url,
+            job_id=context.job_id,
+            project_id=context.project_id,
+            input_json=deepcopy(context.input_json),
+        )
+
+    @staticmethod
+    def _stage_input(context: PipelineContext) -> dict:
+        return {
+            **deepcopy(context.input_json),
+            "project_id": context.project_id,
+        }
+
+    @staticmethod
+    def _output_error(output: object, subject: str) -> str | None:
+        if not isinstance(output, dict):
+            return f"{subject} must be a dict"
+        try:
+            json.dumps(output, allow_nan=False)
+        except (TypeError, ValueError, OverflowError):
+            return f"{subject} must be JSON serializable"
+        return None
+
+    @staticmethod
     def _start_or_cancel(
         state: PipelineState,
         stage: PipelineStage,
@@ -58,11 +87,19 @@ class PipelineOrchestrator:
             return False
         try:
             state.start(stage, input_json)
-        except ValueError as exc:
-            if str(exc) != "cannot start stage while cancellation is requested":
-                raise
+        except PipelineCancellationRequested:
             state.mark_cancelled(stage)
             return False
+        return True
+
+    @staticmethod
+    def _cancel_running_if_requested(
+        state: PipelineState,
+        stage: PipelineStage,
+    ) -> bool:
+        if not state.cancel_requested():
+            return False
+        state.mark_cancelled(stage)
         return True
 
     async def run(self, job_id: str) -> GenerationJob:
@@ -70,14 +107,17 @@ class PipelineOrchestrator:
         state.initialize()
         job, stages = self._snapshot(job_id)
         context = self._context(self.database_url, job)
-        stage_input = {**context.input_json, "project_id": context.project_id}
 
         if job.status == JobStatus.COMPLETED:
             return job
 
         if job.type != JobType.FULL_DRAMA:
             first_stage = PIPELINE_STAGES[0]
-            if not self._start_or_cancel(state, first_stage, stage_input):
+            if not self._start_or_cancel(
+                state,
+                first_stage,
+                self._stage_input(context),
+            ):
                 return self._result(job_id)
             state.fail(
                 first_stage,
@@ -90,15 +130,31 @@ class PipelineOrchestrator:
         for stage in PIPELINE_STAGES:
             stage_row = stages[stage]
             if stage_row.status == StageStatus.COMPLETED:
-                last_stage_output = stage_row.output_json or {}
+                output_error = self._output_error(
+                    stage_row.output_json,
+                    "persisted stage output",
+                )
+                if output_error is not None:
+                    state.fail_completed_output(
+                        stage,
+                        "INVALID_STAGE_OUTPUT",
+                        output_error,
+                    )
+                    return self._result(job_id)
+                last_stage_output = deepcopy(stage_row.output_json)
                 continue
 
-            if not self._start_or_cancel(state, stage, stage_input):
+            if not self._start_or_cancel(state, stage, self._stage_input(context)):
                 return self._result(job_id)
 
             try:
-                output = await self.runtime.execute(stage, context)
+                output = await self.runtime.execute(
+                    stage,
+                    self._runtime_context(context),
+                )
             except Exception as exc:
+                if self._cancel_running_if_requested(state, stage):
+                    return self._result(job_id)
                 state.fail(
                     stage,
                     getattr(exc, "code", "RUNTIME_ERROR"),
@@ -106,21 +162,15 @@ class PipelineOrchestrator:
                 )
                 return self._result(job_id)
 
-            if not isinstance(output, dict):
-                state.fail(stage, "RUNTIME_ERROR", "runtime output must be a dict")
-                return self._result(job_id)
-            try:
-                json.dumps(output, allow_nan=False)
-            except (TypeError, ValueError, OverflowError):
-                state.fail(
-                    stage,
-                    "RUNTIME_ERROR",
-                    "runtime output must be JSON serializable",
-                )
+            output_error = self._output_error(output, "runtime output")
+            if output_error is not None:
+                if self._cancel_running_if_requested(state, stage):
+                    return self._result(job_id)
+                state.fail(stage, "RUNTIME_ERROR", output_error)
                 return self._result(job_id)
 
             state.complete(stage, output)
             last_stage_output = output
 
-        state.finish({"project_id": context.project_id, **last_stage_output})
+        state.finish({**last_stage_output, "project_id": context.project_id})
         return self._result(job_id)

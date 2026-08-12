@@ -6,7 +6,7 @@ import pytest
 from app.core.enums import PIPELINE_STAGES, JobStatus, JobType, StageStatus
 from app.db.session import create_schema, session_scope
 from app.models import GenerationJob, JobEvent, JobStage, Project
-from app.pipeline import PipelineState
+from app.pipeline import PipelineCancellationRequested, PipelineState
 
 
 def seed(tmp_path):
@@ -340,7 +340,7 @@ def test_start_rejects_pending_cancellation_without_mutation(tmp_path):
     state.initialize()
     state.request_cancel()
 
-    with pytest.raises(ValueError, match="cancellation is requested"):
+    with pytest.raises(PipelineCancellationRequested, match="cancellation is requested"):
         state.start(PIPELINE_STAGES[0], {})
 
     job, stages, events = persisted(database, job_id)
