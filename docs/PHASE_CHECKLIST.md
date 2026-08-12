@@ -26,3 +26,17 @@
 - [x] Stop AI services and confirm ports 8020, 8030, and 8188 are free
 
 Phase 8 scope ends at one eligible visible-speaker Shot. Subtitles, multi-shot editing, and the final renderer are not included.
+
+## Phase 9 - subtitles and final render
+
+- [x] Snapshot scenes, shots, dialogues, links, flags, durations, paths, hashes, and project output pointers deterministically
+- [x] Select required LIPSYNC for eligible visible-speaker Shots and VIDEO otherwise
+- [x] Generate deterministic UTF-8 CRLF SRT from measured Dialogue WAV timing without ASR
+- [x] Normalize heterogeneous source media to 640x368 25 FPS and rebuild AAC stereo audio from Dialogue assets
+- [x] Burn locked Microsoft YaHei subtitles and fully decode the H.264/AAC result with strict FFmpeg errors
+- [x] Persist immutable SUBTITLE and FINAL_VIDEO Assets plus exact GenerationManifests after stale-state recheck
+- [x] Serialize concurrent project renders and keep exactly one coherent winner
+- [x] Publish and reconcile `output/final.mp4` as a recoverable alias with READY/DEGRADED semantics
+- [x] Run a real two-Shot smoke, verify all hashes/database links, and visually approve frames/contact sheet
+
+Phase 9 does not add Phase 10 orchestration, BGM, automated quality scoring, broad reliability operations, or UI.

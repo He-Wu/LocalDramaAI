@@ -8,3 +8,6 @@
 - If Qwen3-TTS reports `torch.cuda.is_available() == False`, rerun `scripts/setup_qwen3_tts.ps1`; a CPU-only Torch package may have replaced the verified CUDA junctions.
 - The import-time `SoX could not be found` warning does not block the verified 12Hz voice-clone path. Install the SoX executable only if a future workflow actually needs its transforms.
 - FlashAttention 2 is optional and was not used in the verified Windows Phase 6 runtime. Do not force-install an incompatible Windows build.
+- Phase 9 rejects duplicate Scene/Shot/Dialogue order values, cross-project or wrong-kind Assets, materially short/corrupt media, stale timeline state, and eligible visible-speaker Shots without LIPSYNC. Fix the project graph instead of adding a fallback that would hide an upstream failure.
+- If a render returns `alias_status=DEGRADED`, the immutable FINAL_VIDEO Asset and Project pointer are already committed; do not delete them. The next project render reconciles `output/final.mp4` under the project publication lock. `scripts.verify_phase9` intentionally rejects DEGRADED or stale aliases.
+- FFmpeg failures should retain the exact native executable, stderr, input hashes, and private-job cleanup result. Do not remove `-xerror`, substitute `.cmd`/`.bat` wrappers, or point font configuration at an unlocked directory.

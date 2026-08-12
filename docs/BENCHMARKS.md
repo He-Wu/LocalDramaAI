@@ -57,3 +57,11 @@ The complete smoke peaked close to the 32 GB physical-RAM limit and used a 52.2 
 Output: `E:\kang\github\Movie\artifacts\phase8\20260812-205621-fad213b5\output\musetalk-e0eac769dadc4242ae8b6ac2f9ea55ab.mp4` (video 2.80 s, audio 2.78 s, A/V end delta 20 ms, SHA256 `58029ed0c9f539daed13faf643fba3c03f0c93e23d2814bfd36a44c144d09f98`). Full FFmpeg decode and database/provider-manifest link validation passed; ports 8020, 8030, and 8188 were free after verification.
 
 Start/middle/end frames and the mouth contact sheet were visually approved: mouth shapes vary plausibly without a visible jaw/hand seam, mask edge, mouth tearing, severe flicker, or identity change. The Wan source is slightly soft, so the output is an accepted lip-sync baseline rather than a final-quality render. Phase 8 does not generate subtitles or a final timeline.
+
+## Phase 9 subtitle/final-render smoke (2026-08-12)
+
+| Pipeline | Input Shots | Output profile | Render elapsed | Process RSS peak | System RAM peak | Windows commit peak | Result |
+|---|---:|---|---:|---:|---:|---:|---|
+| Deterministic SRT + FFmpeg final render | 2 | 640x368, 145 frames, 25 FPS, H.264/yuv420p + AAC stereo 48 kHz | 2.611 s | 56.5 MiB | 21,051 MiB | 27,471 MiB | READY |
+
+The manually seeded smoke consumes the locked Phase 8 LIPSYNC, Phase 7 Dialogue WAV, and Phase 5 VIDEO. Output duration is exactly 5.8 seconds for video and audio; immutable output and canonical alias share SHA256 `b5c2bb824e8485530191ec4daed59b80d8855c415678424a31f8558f9a7a0a45`. Strict full decode, 145-frame count, database pointers, Assets, ordered manifests, SRT bytes, provider manifest, runtime/font identity, temp/process cleanup, and alias equality passed. Visual review approved readable Chinese glyphs within the safe margin, subtitle absence after the cue, undistorted framing, and a clean non-black transition.
