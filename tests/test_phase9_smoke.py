@@ -22,6 +22,11 @@ from scripts.smoke_phase9 import (
 from scripts.verify_phase9 import git_identity, resolve_approved_path, verify_phase9
 
 
+def verify_candidate(*args, **kwargs):
+    kwargs["runtime_lock"] = None
+    return verify_phase9(*args, **kwargs)
+
+
 @pytest.fixture(scope="module")
 def real_evidence(tmp_path_factory):
     root = tmp_path_factory.mktemp("phase9-real-smoke")
@@ -81,7 +86,7 @@ def test_seed_rejects_unlocked_source_override(tmp_path: Path) -> None:
 
 def test_verifier_rejects_missing_evidence(tmp_path: Path) -> None:
     with pytest.raises((FileNotFoundError, RuntimeError), match="evidence"):
-        verify_phase9(tmp_path / "missing-evidence.json", evidence_root=tmp_path)
+        verify_candidate(tmp_path / "missing-evidence.json", evidence_root=tmp_path)
 
 
 def test_verifier_rejects_degraded_before_decode(
@@ -93,7 +98,7 @@ def test_verifier_rejects_degraded_before_decode(
     decoded = []
 
     with pytest.raises(RuntimeError, match="READY"):
-        verify_phase9(
+        verify_candidate(
             evidence,
             evidence_root=tmp_path,
             decoder=lambda path: decoded.append(path),
@@ -107,7 +112,7 @@ def test_real_smoke_and_read_only_verifier_pass_full_decode(real_evidence) -> No
     database = Path(result["database"]["path"])
     before = (database.read_bytes(), evidence_path.read_bytes())
 
-    verified = verify_phase9(evidence_path, evidence_root=root)
+    verified = verify_phase9(evidence_path, evidence_root=root, runtime_lock=None)
 
     assert verified == {
         "status": "VERIFIED",
@@ -117,6 +122,13 @@ def test_real_smoke_and_read_only_verifier_pass_full_decode(real_evidence) -> No
         "visual_review": "approved",
     }
     assert (database.read_bytes(), evidence_path.read_bytes()) == before
+
+
+def test_verifier_rejects_internally_valid_but_unlocked_bundle(real_evidence) -> None:
+    root, evidence_path, _ = real_evidence
+
+    with pytest.raises(RuntimeError, match="runtime lock"):
+        verify_phase9(evidence_path, evidence_root=root)
 
 
 def test_git_identity_uses_shared_repository_root_not_worktree() -> None:
@@ -155,7 +167,7 @@ def test_verifier_rejects_evidence_binding_tampering(
     root, evidence = _mutated_evidence(real_evidence, tmp_path, mutation)
 
     with pytest.raises(RuntimeError, match=message):
-        verify_phase9(evidence, evidence_root=root, decoder=lambda _path: None)
+        verify_candidate(evidence, evidence_root=root, decoder=lambda _path: None)
 
 
 def test_verifier_rejects_invalid_srt_bytes(real_evidence) -> None:
@@ -165,7 +177,7 @@ def test_verifier_rejects_invalid_srt_bytes(real_evidence) -> None:
     try:
         subtitle.write_bytes(b"invalid srt")
         with pytest.raises(RuntimeError, match="subtitle SHA256|SRT"):
-            verify_phase9(evidence_path, evidence_root=root, decoder=lambda _path: None)
+            verify_candidate(evidence_path, evidence_root=root, decoder=lambda _path: None)
     finally:
         subtitle.write_bytes(original)
 
@@ -177,7 +189,7 @@ def test_verifier_rejects_alias_mismatch(real_evidence) -> None:
     try:
         alias.write_bytes(b"stale alias")
         with pytest.raises(RuntimeError, match="alias SHA256"):
-            verify_phase9(evidence_path, evidence_root=root, decoder=lambda _path: None)
+            verify_candidate(evidence_path, evidence_root=root, decoder=lambda _path: None)
     finally:
         alias.write_bytes(original)
 
@@ -200,7 +212,7 @@ def test_verifier_rejects_database_pointer_mismatch(real_evidence, tmp_path: Pat
     mutated.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="pointers"):
-        verify_phase9(mutated, evidence_root=root, decoder=lambda _path: None)
+        verify_candidate(mutated, evidence_root=root, decoder=lambda _path: None)
 
 
 def test_verifier_rejects_wrong_probed_frame_count(real_evidence) -> None:
@@ -211,7 +223,7 @@ def test_verifier_rejects_wrong_probed_frame_count(real_evidence) -> None:
     wrong = replace(info, video=replace(info.video, frames=144))
 
     with pytest.raises(RuntimeError, match="profile/frame"):
-        verify_phase9(
+        verify_candidate(
             evidence_path,
             evidence_root=root,
             probe=lambda _path: wrong,
@@ -223,7 +235,7 @@ def test_verifier_propagates_full_decode_failure(real_evidence) -> None:
     root, evidence_path, _ = real_evidence
 
     with pytest.raises(RuntimeError, match="decode sentinel"):
-        verify_phase9(
+        verify_candidate(
             evidence_path,
             evidence_root=root,
             decoder=lambda _path: (_ for _ in ()).throw(RuntimeError("decode sentinel")),
@@ -255,7 +267,7 @@ def test_verifier_rejects_owned_temp(real_evidence) -> None:
     temporary.write_bytes(b"partial")
     try:
         with pytest.raises(RuntimeError, match="temporary"):
-            verify_phase9(evidence_path, evidence_root=root, decoder=lambda _path: None)
+            verify_candidate(evidence_path, evidence_root=root, decoder=lambda _path: None)
     finally:
         temporary.unlink()
 
@@ -271,7 +283,7 @@ def test_verifier_rejects_live_owned_ffmpeg(real_evidence, monkeypatch) -> None:
     monkeypatch.setattr(verifier.psutil, "process_iter", lambda _attrs: [Process()])
 
     with pytest.raises(RuntimeError, match="owned FFmpeg"):
-        verify_phase9(evidence_path, evidence_root=root, decoder=lambda _path: None)
+        verify_candidate(evidence_path, evidence_root=root, decoder=lambda _path: None)
 
 
 def test_owned_process_inspection_failure_is_not_treated_as_clean(
@@ -291,7 +303,7 @@ def test_owned_process_inspection_failure_is_not_treated_as_clean(
     monkeypatch.setattr(verifier.psutil, "process_iter", lambda _attrs: [Process()])
 
     with pytest.raises(RuntimeError, match="inspect running processes"):
-        verify_phase9(evidence_path, evidence_root=root, decoder=lambda _path: None)
+        verify_candidate(evidence_path, evidence_root=root, decoder=lambda _path: None)
 
 
 def test_verifier_rejects_provider_manifest_binding_mismatch(real_evidence) -> None:
@@ -303,7 +315,7 @@ def test_verifier_rejects_provider_manifest_binding_mismatch(real_evidence) -> N
         payload["cue_count"] = 0
         manifest.write_text(json.dumps(payload), encoding="utf-8")
         with pytest.raises(RuntimeError, match="provider manifest SHA256|binding"):
-            verify_phase9(evidence_path, evidence_root=root, decoder=lambda _path: None)
+            verify_candidate(evidence_path, evidence_root=root, decoder=lambda _path: None)
     finally:
         manifest.write_bytes(original)
 
@@ -320,6 +332,6 @@ def test_verifier_rejects_pending_visual_review_before_decode(
     decoded = []
 
     with pytest.raises(RuntimeError, match="approved visual review"):
-        verify_phase9(evidence, evidence_root=root, decoder=lambda path: decoded.append(path))
+        verify_candidate(evidence, evidence_root=root, decoder=lambda path: decoded.append(path))
 
     assert decoded == []

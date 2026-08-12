@@ -457,7 +457,9 @@ def run_smoke(args: argparse.Namespace) -> dict:
     paths["evidence"].write_text(
         json.dumps(evidence, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8"
     )
-    verify_phase9(paths["evidence"], evidence_root=Path(args.evidence_root))
+    verify_phase9(
+        paths["evidence"], evidence_root=Path(args.evidence_root), runtime_lock=None
+    )
     return {**evidence, "evidence_path": str(paths["evidence"])}
 
 

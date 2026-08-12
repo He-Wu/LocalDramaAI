@@ -50,6 +50,36 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _project_storage_root(
+    storage_root: str | os.PathLike[str], project_id: str
+) -> Path:
+    safe_characters = frozenset(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-"
+    )
+    reserved = {
+        "CON", "PRN", "AUX", "NUL",
+        *(f"COM{number}" for number in range(1, 10)),
+        *(f"LPT{number}" for number in range(1, 10)),
+    }
+    if (
+        not isinstance(project_id, str)
+        or not 1 <= len(project_id) <= 36
+        or any(character not in safe_characters for character in project_id)
+        or project_id in {".", ".."}
+        or project_id.split(".", 1)[0].upper() in reserved
+    ):
+        raise ValueError("Phase 9 project ID must be one safe ASCII path segment")
+    projects_root = (Path(storage_root).resolve() / "projects").resolve()
+    project_root = (projects_root / project_id).resolve()
+    try:
+        relative = project_root.relative_to(projects_root)
+    except ValueError as exc:
+        raise ValueError("Phase 9 project ID escapes the storage root") from exc
+    if len(relative.parts) != 1:
+        raise ValueError("Phase 9 project ID must be one safe ASCII path segment")
+    return project_root
+
+
 def _cleanup_generation_artifacts(
     paths: tuple[Path, ...], primary_error: BaseException
 ) -> None:
@@ -200,11 +230,11 @@ def render_project(
     provider: FFmpegRenderProvider,
     storage_root: str | os.PathLike[str],
 ) -> RenderProjectResult:
+    project_root = _project_storage_root(storage_root, project_id)
     timeline = build_render_timeline(database_url, project_id)
     cues = cues_from_timeline(timeline)
     srt = serialize_srt(cues)
     generation_id = str(uuid.uuid4())
-    project_root = Path(storage_root).resolve() / "projects" / project_id
     subtitle_path = project_root / "subtitles" / f"{generation_id}.srt"
     output_path = project_root / "render" / f"{generation_id}.mp4"
     manifest_path = project_root / "manifests" / f"{generation_id}.json"

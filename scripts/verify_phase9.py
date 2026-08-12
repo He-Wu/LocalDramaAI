@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Callable
 
 import psutil
+import yaml
 
 from app.services.media_probe import AVInfo, probe_av
 PHASE8_LIPSYNC = Path(
@@ -69,6 +70,67 @@ def _verify_git_identity(record: object) -> None:
     )
     if ancestor.returncode != 0:
         raise RuntimeError("Phase 9 Git commit is not an ancestor of the current checkout")
+
+
+def _verify_runtime_lock(
+    evidence_path: Path, evidence: dict, runtime_lock: Path
+) -> None:
+    try:
+        lock = yaml.safe_load(Path(runtime_lock).read_text(encoding="utf-8"))
+        verification = lock["verification"]
+    except (OSError, UnicodeError, yaml.YAMLError, KeyError, TypeError) as exc:
+        raise RuntimeError("Phase 9 runtime lock is missing or invalid") from exc
+    if str(verification.get("phase")) != "9":
+        raise RuntimeError("Phase 9 runtime lock phase mismatch")
+
+    def require_path(key: str, actual: object) -> Path:
+        try:
+            locked = Path(verification[key]).resolve(strict=True)
+            measured = Path(actual).resolve(strict=True)
+        except (KeyError, OSError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"Phase 9 runtime lock {key} path mismatch") from exc
+        if locked != measured:
+            raise RuntimeError(f"Phase 9 runtime lock {key} path mismatch")
+        return measured
+
+    def require_hash(key: str, path: Path) -> None:
+        if verification.get(key) != _sha256(path):
+            raise RuntimeError(f"Phase 9 runtime lock {key} mismatch")
+
+    output = _require_record(evidence.get("output"), "output")
+    subtitle = _require_record(evidence.get("subtitle"), "subtitle")
+    database = _require_record(evidence.get("database"), "database")
+    manifest = _require_record(evidence.get("provider_manifest"), "provider manifest")
+    resources = _require_record(evidence.get("resources"), "resources")
+    review = _require_record(evidence.get("review"), "review")
+    git = _require_record(evidence.get("git"), "git")
+
+    locked_evidence = require_path("phase9_evidence", evidence_path)
+    immutable = require_path("phase9_output", output.get("immutable_path"))
+    alias = require_path("phase9_alias", output.get("alias_path"))
+    locked_subtitle = require_path("phase9_subtitle", subtitle.get("path"))
+    locked_database = require_path("phase9_database", database.get("path"))
+    locked_manifest = require_path("phase9_provider_manifest", manifest.get("path"))
+    locked_resources = require_path("phase9_resources", resources.get("path"))
+    contact = _require_record(review.get("contact_sheet"), "review contact_sheet")
+    locked_contact = require_path("phase9_contact_sheet", contact.get("path"))
+
+    require_hash("phase9_evidence_sha256", locked_evidence)
+    require_hash("phase9_output_sha256", immutable)
+    if verification.get("phase9_output_sha256") != _sha256(alias):
+        raise RuntimeError("Phase 9 runtime lock alias hash mismatch")
+    require_hash("phase9_subtitle_sha256", locked_subtitle)
+    require_hash("phase9_database_sha256", locked_database)
+    require_hash("phase9_provider_manifest_sha256", locked_manifest)
+    require_hash("phase9_resources_sha256", locked_resources)
+    require_hash("phase9_contact_sheet_sha256", locked_contact)
+    if (
+        verification.get("phase9_run_id") != evidence.get("run_id")
+        or verification.get("phase9_code_commit") != git.get("commit")
+        or verification.get("phase9_alias_status") != evidence.get("alias_status")
+        or verification.get("phase9_visual_review") != evidence.get("visual_review")
+    ):
+        raise RuntimeError("Phase 9 runtime lock evidence identity mismatch")
 
 
 def _require_record(record: object, label: str) -> dict:
@@ -327,6 +389,7 @@ def verify_phase9(
     evidence_root: Path,
     decoder: Callable[[Path], None] | None = None,
     probe: Callable[[Path], AVInfo] | None = None,
+    runtime_lock: Path | None = ROOT / "runtime" / "runtime-lock.yaml",
 ) -> dict:
     root = Path(evidence_root).resolve()
     evidence_path = resolve_approved_path(str(evidence_path), (root,), "evidence")
@@ -342,6 +405,8 @@ def verify_phase9(
         raise RuntimeError("Phase 9 evidence requires alias_status READY")
     if evidence.get("visual_review") != "approved":
         raise RuntimeError("Phase 9 evidence requires approved visual review")
+    if runtime_lock is not None:
+        _verify_runtime_lock(evidence_path, evidence, runtime_lock)
     artifact_root = (root / "artifacts" / "phase9").resolve()
     runtime_root = (root / ".runtime" / "phase9").resolve()
     source_roots = (Path("E:/kang/github/Movie/artifacts").resolve(),)

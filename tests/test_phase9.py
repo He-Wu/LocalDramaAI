@@ -19,7 +19,7 @@ from app.providers.ffmpeg_render_provider import (
     FFmpegRenderResult,
 )
 from app.services.media_probe import AVInfo, AudioStreamInfo, VideoStreamInfo
-from app.services.render_generation import render_project
+from app.services.render_generation import _project_storage_root, render_project
 from app.services.render_timeline import (
     RenderProfile,
     RenderTimeline,
@@ -34,6 +34,25 @@ from app.services.video_probe import VideoInfo
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "project_id",
+    ["../escape", "..\\escape", "C:/outside", "C:\\outside", "/absolute"],
+)
+def test_project_storage_root_rejects_unsafe_database_ids(
+    tmp_path: Path, project_id: str
+) -> None:
+    with pytest.raises(ValueError, match="project ID"):
+        _project_storage_root(tmp_path, project_id)
+
+
+def test_project_storage_root_is_contained_for_uuid(tmp_path: Path) -> None:
+    project_id = "12345678-1234-4234-9234-123456789abc"
+
+    root = _project_storage_root(tmp_path, project_id)
+
+    assert root == (tmp_path / "projects" / project_id).resolve()
 
 
 def _generation_artifacts(seed_project: SeedProject) -> set[Path]:
